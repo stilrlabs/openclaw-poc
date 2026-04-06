@@ -258,9 +258,16 @@ def build_workspace_inventory(repo_root: Path) -> dict[str, Any]:
         (repo_root / "pnpm-workspace.yaml").read_text(encoding="utf-8"),
         Loader=yaml.BaseLoader,
     )
-    workspace_patterns = sorted(workspace_config.get("packages", []))
+    raw_workspace_patterns = workspace_config.get("packages", [])
+    workspace_patterns = sorted(
+        pattern
+        for pattern in raw_workspace_patterns
+        if isinstance(pattern, str) and pattern.strip()
+    )
     package_dirs: set[Path] = {repo_root}
     for pattern in workspace_patterns:
+        if pattern in {".", "./"}:
+            continue
         for match in sorted(repo_root.glob(pattern)):
             package_json = match / "package.json"
             if match.is_dir() and package_json.is_file():
