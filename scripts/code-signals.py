@@ -18,7 +18,7 @@ from typing import Any
 import yaml
 
 REPOMIX_VERSION = "1.13.1"
-MADGE_VERSION = "8.0.0"
+DEPENDENCY_CRUISER_VERSION = "17.3.10"
 DEFAULT_REPOMIX_STYLE = "markdown"
 TREE_IGNORES = {".artifacts", ".git", "coverage", "dist", "node_modules"}
 EXTENSION_LANGUAGE_MAP = {
@@ -101,7 +101,7 @@ def main() -> int:
     write_json(out_dir / "docs-inventory.json", build_docs_inventory(repo_root, tracked_files))
     write_json(out_dir / "language-summary.json", build_language_summary(repo_root, tracked_files))
     write_json(out_dir / "tags.json", build_ctags_inventory(repo_root, tracked_files))
-    write_json(out_dir / "ts-deps.json", build_madge_graph(repo_root))
+    write_json(out_dir / "ts-deps.json", build_dependency_cruiser_graph(repo_root))
     write_optional_json(
         out_dir / "ts-topology-owner-map.json",
         build_optional_json_command(
@@ -484,17 +484,17 @@ def build_ctags_inventory(repo_root: Path, tracked_files: list[str]) -> dict[str
     return {"source": "universal-ctags", "pseudoTags": pseudo_tags, "tags": tags}
 
 
-def build_madge_graph(repo_root: Path) -> dict[str, Any]:
+def build_dependency_cruiser_graph(repo_root: Path) -> dict[str, Any]:
     result = run_command(
         [
             "pnpm",
             "dlx",
-            f"madge@{MADGE_VERSION}",
+            f"dependency-cruiser@{DEPENDENCY_CRUISER_VERSION}",
+            "--no-config",
             "--ts-config",
             "tsconfig.json",
-            "--extensions",
-            "ts,tsx,mts,cts,js,mjs,cjs,jsx",
-            "--json",
+            "--output-type",
+            "json",
             "src",
             "extensions",
             "packages",
@@ -505,14 +505,8 @@ def build_madge_graph(repo_root: Path) -> dict[str, Any]:
     )
     raw = json.loads(result.stdout)
     return {
-        "source": "madge",
-        "modules": [
-            {
-                "module": module,
-                "dependencies": sorted(dependencies),
-            }
-            for module, dependencies in sorted(raw.items())
-        ],
+        "source": "dependency-cruiser",
+        "cruiseResult": raw,
     }
 
 
@@ -544,7 +538,7 @@ def build_summary(
         f"- Generated at: `{generated_at}`\n"
         f"- Repomix style: `{repomix_style}`\n"
         f"- Repomix version: `{REPOMIX_VERSION}`\n"
-        f"- Madge version: `{MADGE_VERSION}`\n\n"
+        f"- Dependency-cruiser version: `{DEPENDENCY_CRUISER_VERSION}`\n\n"
         "## Generated Files\n"
         + "\n".join(file_lines)
         + "\n"
