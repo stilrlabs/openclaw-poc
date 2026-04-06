@@ -21,6 +21,18 @@ REPOMIX_VERSION = "1.13.1"
 DEPENDENCY_CRUISER_VERSION = "17.3.10"
 DEFAULT_REPOMIX_STYLE = "markdown"
 TREE_IGNORES = {".artifacts", ".git", "coverage", "dist", "node_modules"}
+SYMBOL_SUMMARY_LANGUAGES = {"JavaScript", "TypeScript"}
+SYMBOL_SUMMARY_KINDS = {
+    "class",
+    "constant",
+    "enum",
+    "function",
+    "interface",
+    "method",
+    "module",
+    "type",
+    "variable",
+}
 EXTENSION_LANGUAGE_MAP = {
     ".cjs": "JavaScript",
     ".cts": "TypeScript",
@@ -100,7 +112,9 @@ def main() -> int:
     write_json(out_dir / "workflow-inventory.json", build_workflow_inventory(repo_root, tracked_files))
     write_json(out_dir / "docs-inventory.json", build_docs_inventory(repo_root, tracked_files))
     write_json(out_dir / "language-summary.json", build_language_summary(repo_root, tracked_files))
-    write_json(out_dir / "tags.json", build_ctags_inventory(repo_root, tracked_files))
+    ctags_inventory = build_ctags_inventory(repo_root, tracked_files)
+    write_json(out_dir / "tags.json", ctags_inventory)
+    write_json(out_dir / "symbol-summary.json", summarize_ctags_inventory(ctags_inventory))
     write_json(out_dir / "ts-deps.json", build_dependency_cruiser_graph(repo_root))
     write_optional_json(
         out_dir / "ts-topology-owner-map.json",
@@ -482,6 +496,66 @@ def build_ctags_inventory(repo_root: Path, tracked_files: list[str]) -> dict[str
     tags.sort(key=lambda tag: (tag.get("path", ""), tag.get("line", 0), tag.get("kind", ""), tag.get("name", "")))
     pseudo_tags.sort(key=lambda tag: (tag.get("name", ""), tag.get("path", "")))
     return {"source": "universal-ctags", "pseudoTags": pseudo_tags, "tags": tags}
+
+
+def summarize_ctags_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
+    tags = inventory.get("tags", [])
+    filtered = []
+    for tag in tags:
+        if not isinstance(tag, dict):
+            continue
+        language = tag.get("language")
+        kind = tag.get("kind")
+        path = tag.get("path")
+        if language not in SYMBOL_SUMMARY_LANGUAGES:
+            continue
+        if kind not in SYMBOL_SUMMARY_KINDS:
+            continue
+        if not isinstance(path, str) or not path.startswith(("src/", "extensions/", "packages/", "ui/")):
+            continue
+        filtered.append(
+            {
+                "name": tag.get("name"),
+                "kind": kind,
+                "language": language,
+                "path": path,
+                "scope": tag.get("scope"),
+            }
+        )
+    filtered.sort(
+        key=lambda tag: (
+            str(tag.get("path") or ""),
+            str(tag.get("kind") or ""),
+            str(tag.get("name") or ""),
+        )
+    )
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for tag in filtered:
+        by_path.setdefault(tag["path"], []).append(tag)
+    important_paths = sorted(
+        (
+            {
+                "path": path,
+                "symbolCount": len(path_tags),
+                "sampleSymbols": [
+                    {
+                        "name": path_tag.get("name"),
+                        "kind": path_tag.get("kind"),
+                        "scope": path_tag.get("scope"),
+                    }
+                    for path_tag in path_tags[:6]
+                ],
+            }
+            for path, path_tags in by_path.items()
+        ),
+        key=lambda item: (-item["symbolCount"], item["path"]),
+    )[:24]
+    important_symbols = filtered[:120]
+    return {
+        "source": "curated-from-tags",
+        "importantPaths": important_paths,
+        "importantSymbols": important_symbols,
+    }
 
 
 def build_dependency_cruiser_graph(repo_root: Path) -> dict[str, Any]:

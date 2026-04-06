@@ -31,8 +31,49 @@ DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen3.5:2b"
 DEFAULT_MIN_RECORDS = 25
 DEFAULT_EVAL_SAMPLE_SIZE = 50
-MAX_EXCERPT_CHARS = 320
+MAX_EXCERPT_CHARS = 220
 DEFAULT_ARTIFACT_PREFIX = "code-signals-"
+MAX_EVIDENCE_ITEMS = 2
+TOP_LEVEL_ROUTING_DIRS = ["src", "extensions", "packages", "ui", "apps", "docs", ".github"]
+SYMBOL_SUMMARY_MAX_PATHS = 24
+SYMBOL_SUMMARY_MAX_SYMBOLS = 120
+SYMBOL_ALLOWED_LANGUAGES = {"JavaScript", "TypeScript"}
+SYMBOL_ALLOWED_KINDS = {
+    "class",
+    "constant",
+    "enum",
+    "function",
+    "interface",
+    "method",
+    "module",
+    "type",
+    "variable",
+}
+LOW_VALUE_DOC_PATTERNS = (
+    "code fence",
+    "code fences",
+    "heading count",
+    "supported code fence",
+)
+LOW_VALUE_RESPONSE_PATTERNS = (
+    "open the file",
+    "navigate to the source by opening",
+)
+RECORD_TYPE_CAP_RATIO = {
+    "doc-grounded-qa": 0.12,
+    "repo-facts": 0.45,
+    "repo-navigation": 0.30,
+    "architecture-explanations": 0.35,
+    "dependency-reasoning": 0.25,
+}
+BUCKET_PRIORITY = {
+    "ownership": 100,
+    "routing": 90,
+    "boundary": 85,
+    "impact": 80,
+    "symbol": 60,
+    "docs": 40,
+}
 
 
 @dataclass(frozen=True)
@@ -46,6 +87,7 @@ class EvidenceEntry:
 class GenerationUnit:
     unit_id: str
     unit_type: str
+    signal_bucket: str
     title: str
     prompt_context: dict[str, Any]
     source_artifacts: list[str]
@@ -240,6 +282,7 @@ def generate_training_data(args: argparse.Namespace) -> None:
             f"Generated only {len(records)} records, below the minimum required {args.min_records}."
         )
 
+    records = rebalance_records(records)
     records.sort(key=lambda record: (record["record_type"], record["prompt"], record["response"]))
     write_jsonl(out_dir / "synthetic-training-corpus.jsonl", records)
     write_jsonl(out_dir / "synthetic-chat-sft.jsonl", [to_chat_sft_record(record) for record in records])
@@ -264,12 +307,20 @@ def load_bundle(input_dir: Path) -> dict[str, Any]:
     bundle: dict[str, Any] = {"input_dir": input_dir}
     bundle["summary_markdown"] = read_text(input_dir / "summary.md")
     bundle["summary"] = parse_summary(bundle["summary_markdown"])
+    bundle["repo_tree_markdown"] = read_optional_text(input_dir / "repo-tree.md")
+    bundle["repo_tree_summary"] = parse_repo_tree_summary(bundle["repo_tree_markdown"])
     bundle["workspace_packages"] = read_json(input_dir / "workspace-packages.json")
     bundle["plugin_manifests"] = read_json(input_dir / "plugin-manifests.json")
     bundle["workflow_inventory"] = read_json(input_dir / "workflow-inventory.json")
     bundle["docs_inventory"] = read_json(input_dir / "docs-inventory.json")
     bundle["language_summary"] = read_json(input_dir / "language-summary.json")
     bundle["ts_deps"] = read_json(input_dir / "ts-deps.json")
+    bundle["ts_topology_owner_map"] = read_optional_json(input_dir / "ts-topology-owner-map.json")
+    bundle["ts_topology_consumer_topology"] = read_optional_json(
+        input_dir / "ts-topology-consumer-topology.json"
+    )
+    bundle["seam_inventory"] = read_optional_json(input_dir / "seam-inventory.json")
+    bundle["symbol_summary"] = load_symbol_summary(input_dir)
     return bundle
 
 
@@ -285,6 +336,106 @@ def parse_summary(summary_markdown: str) -> dict[str, str]:
     return fields
 
 
+def parse_repo_tree_summary(repo_tree_markdown: str | None) -> dict[str, Any] | None:
+    if not repo_tree_markdown:
+        return None
+    match = re.search(r"```text\n(.*?)\n```", repo_tree_markdown, re.DOTALL)
+    if not match:
+        return None
+    lines = [line.rstrip() for line in match.group(1).splitlines() if line.strip()]
+    top_level_entries: list[str] = []
+    key_root_children: dict[str, list[str]] = {}
+    current_root: str | None = None
+    for line in lines:
+        if line == ".":
+            continue
+        normalized = line.replace("│", " ").replace("├", " ").replace("└", " ").replace("──", " ")
+        stripped = normalized.strip()
+        if not stripped:
+            continue
+        indent = len(normalized) - len(normalized.lstrip(" "))
+        if indent == 0:
+            current_root = stripped
+            top_level_entries.append(stripped)
+            key_root_children.setdefault(stripped, [])
+            continue
+        if indent == 4 and current_root in TOP_LEVEL_ROUTING_DIRS:
+            children = key_root_children.setdefault(current_root, [])
+            if len(children) < 8:
+                children.append(stripped)
+    return {
+        "topLevelEntries": top_level_entries[:24],
+        "keyRoots": {root: children for root, children in key_root_children.items() if children},
+    }
+
+
+def load_symbol_summary(input_dir: Path) -> dict[str, Any] | None:
+    explicit_summary = read_optional_json(input_dir / "symbol-summary.json")
+    if explicit_summary is not None:
+        return explicit_summary
+    tags_path = input_dir / "tags.json"
+    if not tags_path.is_file():
+        return None
+    tags_payload = read_json(tags_path)
+    tags = tags_payload.get("tags", [])
+    filtered = []
+    for tag in tags:
+        if not isinstance(tag, dict):
+            continue
+        language = tag.get("language")
+        kind = tag.get("kind")
+        path = tag.get("path")
+        if language not in SYMBOL_ALLOWED_LANGUAGES:
+            continue
+        if kind not in SYMBOL_ALLOWED_KINDS:
+            continue
+        if not isinstance(path, str) or not path.startswith(("src/", "extensions/", "packages/", "ui/")):
+            continue
+        filtered.append(
+            {
+                "name": tag.get("name"),
+                "kind": kind,
+                "language": language,
+                "path": path,
+                "scope": tag.get("scope"),
+            }
+        )
+    filtered.sort(
+        key=lambda tag: (
+            str(tag.get("path") or ""),
+            str(tag.get("kind") or ""),
+            str(tag.get("name") or ""),
+        )
+    )
+    by_path: dict[str, list[dict[str, Any]]] = {}
+    for tag in filtered:
+        by_path.setdefault(tag["path"], []).append(tag)
+    top_paths = sorted(
+        (
+            {
+                "path": path,
+                "symbolCount": len(path_tags),
+                "sampleSymbols": [
+                    {
+                        "name": path_tag.get("name"),
+                        "kind": path_tag.get("kind"),
+                        "scope": path_tag.get("scope"),
+                    }
+                    for path_tag in path_tags[:6]
+                ],
+            }
+            for path, path_tags in by_path.items()
+        ),
+        key=lambda item: (-item["symbolCount"], item["path"]),
+    )[:SYMBOL_SUMMARY_MAX_PATHS]
+    top_symbols = filtered[:SYMBOL_SUMMARY_MAX_SYMBOLS]
+    return {
+        "source": "derived-from-tags",
+        "importantPaths": top_paths,
+        "importantSymbols": top_symbols,
+    }
+
+
 def build_generation_units(
     bundle: dict[str, Any],
     *,
@@ -293,57 +444,97 @@ def build_generation_units(
     max_doc_units: int,
     max_dependency_units: int,
 ) -> list[GenerationUnit]:
-    units: list[GenerationUnit] = []
-    units.extend(build_repo_summary_units(bundle))
-    units.extend(build_plugin_units(bundle, max_plugin_units))
-    units.extend(build_workflow_units(bundle, max_workflow_units))
-    units.extend(build_doc_units(bundle, max_doc_units))
-    units.extend(build_dependency_units(bundle, max_dependency_units))
-    return units
+    ownership_units = build_ownership_units(bundle, max_plugin_units)
+    routing_units = build_routing_units(bundle, max_workflow_units)
+    boundary_units = build_boundary_units(bundle)
+    impact_units = build_impact_units(bundle, max_dependency_units)
+    doc_units = build_doc_routing_units(bundle, max_doc_units)
+    symbol_units = build_curated_symbol_units(bundle, max(4, max_doc_units // 2))
+    units = [
+        *ownership_units,
+        *routing_units,
+        *boundary_units,
+        *impact_units,
+        *doc_units,
+        *symbol_units,
+    ]
+    return sorted(
+        units,
+        key=lambda unit: (
+            -BUCKET_PRIORITY.get(unit.signal_bucket, 0),
+            unit.unit_type,
+            unit.unit_id,
+        ),
+    )
 
 
-def build_repo_summary_units(bundle: dict[str, Any]) -> list[GenerationUnit]:
+def make_unit(
+    *,
+    unit_id: str,
+    unit_type: str,
+    signal_bucket: str,
+    title: str,
+    prompt_context: dict[str, Any],
+    source_artifacts: list[str],
+    evidence: list[EvidenceEntry],
+    preferred_record_types: list[str],
+    example_budget: int,
+) -> GenerationUnit:
+    return GenerationUnit(
+        unit_id=unit_id,
+        unit_type=unit_type,
+        signal_bucket=signal_bucket,
+        title=title,
+        prompt_context=prompt_context,
+        source_artifacts=source_artifacts,
+        evidence=evidence[:MAX_EVIDENCE_ITEMS],
+        preferred_record_types=preferred_record_types,
+        example_budget=example_budget,
+    )
+
+
+def build_ownership_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
     packages = bundle["workspace_packages"]["packages"]
-    languages = bundle["language_summary"]["languages"]
     summary_fields = bundle["summary"]
-    repo_unit = GenerationUnit(
-        unit_id="repo-summary",
-        unit_type="repo-summary",
-        title="Repository summary",
-        prompt_context={
-            "commit": summary_fields.get("commit"),
-            "repo": summary_fields.get("repo"),
-            "workspace_package_count": len(packages),
-            "top_languages": languages[:8],
-            "generated_files": summary_fields,
-        },
-        source_artifacts=["summary.md", "workspace-packages.json", "language-summary.json"],
-        evidence=[
-            evidence_from_object("summary.md", "frontmatter", summary_fields),
-            evidence_from_object("workspace-packages.json", "packages", packages[:8]),
-            evidence_from_object("language-summary.json", "languages", languages[:8]),
-        ],
-        preferred_record_types=["repo-facts", "architecture-explanations"],
-        example_budget=4,
-    )
+    tree_summary = bundle.get("repo_tree_summary") or {}
+    units = [
+        make_unit(
+            unit_id="repo-summary",
+            unit_type="repo-summary",
+            signal_bucket="ownership",
+            title="Repository summary",
+            prompt_context={
+                "repo": summary_fields.get("repo"),
+                "commit": summary_fields.get("commit"),
+                "workspacePackageCount": len(packages),
+                "topLevelEntries": tree_summary.get("topLevelEntries", [])[:12],
+            },
+            source_artifacts=["summary.md", "workspace-packages.json", "repo-tree.md"],
+            evidence=[
+                evidence_from_object("summary.md", "frontmatter", summary_fields),
+                evidence_from_object("workspace-packages.json", "packages", packages[:8]),
+                evidence_from_object("repo-tree.md", "topLevelEntries", tree_summary.get("topLevelEntries", [])[:12]),
+            ],
+            preferred_record_types=["repo-facts", "repo-navigation"],
+            example_budget=3,
+        ),
+        make_unit(
+            unit_id="workspace-packages-overview",
+            unit_type="workspace-overview",
+            signal_bucket="ownership",
+            title="Workspace packages overview",
+            prompt_context={
+                "packageCount": len(packages),
+                "samplePackages": packages[:16],
+            },
+            source_artifacts=["workspace-packages.json"],
+            evidence=[evidence_from_object("workspace-packages.json", "packages", packages[:16])],
+            preferred_record_types=["repo-facts", "repo-navigation"],
+            example_budget=3,
+        ),
+    ]
 
-    package_unit = GenerationUnit(
-        unit_id="workspace-packages-overview",
-        unit_type="workspace-overview",
-        title="Workspace packages overview",
-        prompt_context={
-            "package_count": len(packages),
-            "sample_packages": packages[:20],
-        },
-        source_artifacts=["workspace-packages.json"],
-        evidence=[evidence_from_object("workspace-packages.json", "packages", packages[:20])],
-        preferred_record_types=["repo-facts", "repo-navigation"],
-        example_budget=3,
-    )
-    return [repo_unit, package_unit]
-
-
-def build_plugin_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
+    plugin_units = []
     plugins = bundle["plugin_manifests"]["plugins"]
     normalized_plugins = []
     for plugin in plugins:
@@ -356,7 +547,7 @@ def build_plugin_units(bundle: dict[str, Any], limit: int) -> list[GenerationUni
                 "enabledByDefault": manifest.get("enabledByDefault"),
                 "providers": manifest.get("providers", []),
                 "contracts": sorted((manifest.get("contracts") or {}).keys()),
-                "configSchemaProperties": sorted((manifest.get("configSchema", {}).get("properties") or {}).keys()),
+                "configKeys": sorted((manifest.get("configSchema", {}).get("properties") or {}).keys()),
                 "providerAuthChoices": [
                     choice.get("choiceId")
                     for choice in manifest.get("providerAuthChoices", [])
@@ -364,97 +555,191 @@ def build_plugin_units(bundle: dict[str, Any], limit: int) -> list[GenerationUni
                 ],
             }
         )
-
-    selected = sorted(
+    selected_plugins = sorted(
         normalized_plugins,
         key=lambda plugin: (
             -len(plugin["contracts"]),
-            -len(plugin["configSchemaProperties"]),
+            -len(plugin["configKeys"]),
             str(plugin["id"] or ""),
         ),
     )[:limit]
-
-    units = []
-    for index, plugin in enumerate(selected):
-        units.append(
-            GenerationUnit(
+    for index, plugin in enumerate(selected_plugins):
+        plugin_units.append(
+            make_unit(
                 unit_id=f"plugin-{plugin['id'] or index}",
                 unit_type="plugin",
+                signal_bucket="ownership",
                 title=f"Plugin {plugin['id']}",
                 prompt_context=plugin,
                 source_artifacts=["plugin-manifests.json"],
                 evidence=[evidence_from_object("plugin-manifests.json", f"plugins[{index}]", plugin)],
                 preferred_record_types=["repo-facts", "repo-navigation", "architecture-explanations"],
-                example_budget=3,
+                example_budget=2,
             )
         )
+
+    units.extend(plugin_units)
+    units.extend(build_topology_owner_units(bundle))
     return units
 
 
-def build_workflow_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
+def build_routing_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
+    units: list[GenerationUnit] = []
+    tree_summary = bundle.get("repo_tree_summary")
+    if tree_summary:
+        units.append(
+            make_unit(
+                unit_id="repo-topology-overview",
+                unit_type="repo-topology",
+                signal_bucket="routing",
+                title="Repository topology overview",
+                prompt_context=tree_summary,
+                source_artifacts=["repo-tree.md"],
+                evidence=[evidence_from_object("repo-tree.md", "summary", tree_summary)],
+                preferred_record_types=["repo-navigation", "repo-facts"],
+                example_budget=3,
+            )
+        )
+        for root_name in TOP_LEVEL_ROUTING_DIRS:
+            children = tree_summary.get("keyRoots", {}).get(root_name, [])
+            if not children:
+                continue
+            units.append(
+                make_unit(
+                    unit_id=f"routing-{slugify(root_name)}",
+                    unit_type="routing-root",
+                    signal_bucket="routing",
+                    title=f"Routing root {root_name}",
+                    prompt_context={"root": root_name, "children": children[:8]},
+                    source_artifacts=["repo-tree.md"],
+                    evidence=[evidence_from_object("repo-tree.md", f"root:{root_name}", children[:8])],
+                    preferred_record_types=["repo-navigation", "repo-facts"],
+                    example_budget=2,
+                )
+            )
+
     workflows = bundle["workflow_inventory"]["workflows"]
     selected = sorted(
         workflows,
         key=lambda workflow: (-int(workflow.get("jobCount", 0)), str(workflow.get("name") or "")),
     )[:limit]
-    units = []
     for index, workflow in enumerate(selected):
         context = {
             "name": workflow.get("name"),
             "path": workflow.get("path"),
             "triggers": workflow.get("triggers"),
             "jobCount": workflow.get("jobCount"),
-            "jobs": workflow.get("jobs", [])[:12],
+            "jobIds": [job.get("id") for job in workflow.get("jobs", [])[:10]],
         }
         units.append(
-            GenerationUnit(
+            make_unit(
                 unit_id=f"workflow-{slugify(workflow.get('name') or workflow.get('path') or str(index))}",
-                unit_type="workflow",
+                unit_type="workflow-routing",
+                signal_bucket="routing",
                 title=f"Workflow {workflow.get('name')}",
                 prompt_context=context,
                 source_artifacts=["workflow-inventory.json"],
                 evidence=[evidence_from_object("workflow-inventory.json", f"workflows[{index}]", context)],
-                preferred_record_types=["repo-facts", "repo-navigation", "architecture-explanations"],
-                example_budget=3,
-            )
-        )
-    return units
-
-
-def build_doc_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
-    pages = bundle["docs_inventory"]["pages"]
-    selected = sorted(
-        pages,
-        key=lambda page: (
-            -(len(page.get("headings", [])) + len(page.get("links", []))),
-            str(page.get("path") or ""),
-        ),
-    )[:limit]
-    units = []
-    for index, page in enumerate(selected):
-        context = {
-            "path": page.get("path"),
-            "title": page.get("title"),
-            "headings": page.get("headings", [])[:12],
-            "links": page.get("links", [])[:12],
-            "codeFenceLanguages": page.get("codeFenceLanguages", []),
-        }
-        units.append(
-            GenerationUnit(
-                unit_id=f"doc-{slugify(page.get('path') or str(index))}",
-                unit_type="doc-page",
-                title=f"Doc page {page.get('path')}",
-                prompt_context=context,
-                source_artifacts=["docs-inventory.json"],
-                evidence=[evidence_from_object("docs-inventory.json", f"pages[{index}]", context)],
-                preferred_record_types=["doc-grounded-qa", "repo-navigation", "architecture-explanations"],
+                preferred_record_types=["repo-navigation", "repo-facts"],
                 example_budget=2,
             )
         )
     return units
 
 
-def build_dependency_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
+def build_boundary_units(bundle: dict[str, Any]) -> list[GenerationUnit]:
+    units: list[GenerationUnit] = []
+    consumer_topology = bundle.get("ts_topology_consumer_topology")
+    if isinstance(consumer_topology, dict):
+        for index, record in enumerate((consumer_topology.get("records") or [])[:10]):
+            context = {
+                "symbol": first_present(record, "canonicalKey", "publicSpecifiers", default="<unknown>"),
+                "declarationPath": record.get("declarationPath"),
+                "productionOwners": record.get("productionOwners", [])[:6],
+                "productionConsumers": record.get("productionConsumers", [])[:6],
+                "productionRefCount": record.get("productionRefCount"),
+            }
+            units.append(
+                make_unit(
+                    unit_id=f"boundary-consumer-{index}",
+                    unit_type="topology-consumer",
+                    signal_bucket="boundary",
+                    title=f"Topology consumer {index + 1}",
+                    prompt_context=context,
+                    source_artifacts=["ts-topology-consumer-topology.json"],
+                    evidence=[
+                        evidence_from_object(
+                            "ts-topology-consumer-topology.json",
+                            f"records[{index}]",
+                            context,
+                        )
+                    ],
+                    preferred_record_types=["repo-navigation", "architecture-explanations"],
+                    example_budget=2,
+                )
+            )
+
+    seam_inventory = bundle.get("seam_inventory")
+    if isinstance(seam_inventory, dict):
+        duplicated = seam_inventory.get("duplicatedSeamFamilies") or {}
+        for family_name, family in list(sorted(duplicated.items()))[:8]:
+            context = {
+                "family": family_name,
+                "count": family.get("count"),
+                "files": family.get("files", [])[:6],
+            }
+            units.append(
+                make_unit(
+                    unit_id=f"seam-{slugify(family_name)}",
+                    unit_type="seam-family",
+                    signal_bucket="boundary",
+                    title=f"Seam family {family_name}",
+                    prompt_context=context,
+                    source_artifacts=["seam-inventory.json"],
+                    evidence=[evidence_from_object("seam-inventory.json", f"duplicatedSeamFamilies.{family_name}", context)],
+                    preferred_record_types=["architecture-explanations", "repo-navigation"],
+                    example_budget=2,
+                )
+            )
+    return units
+
+
+def build_doc_routing_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
+    pages = bundle["docs_inventory"]["pages"]
+    selected = sorted(
+        (
+            page
+            for page in pages
+            if isinstance(page.get("path"), str)
+            and not page["path"].startswith(("docs/.generated/", "docs/.i18n/"))
+        ),
+        key=lambda page: (doc_priority(page), str(page.get("path") or "")),
+    )[:limit]
+    units = []
+    for index, page in enumerate(selected):
+        context = {
+            "path": page.get("path"),
+            "title": page.get("title"),
+            "headings": page.get("headings", [])[:8],
+            "links": page.get("links", [])[:8],
+        }
+        units.append(
+            make_unit(
+                unit_id=f"doc-{slugify(page.get('path') or str(index))}",
+                unit_type="doc-page",
+                signal_bucket="docs",
+                title=f"Doc page {page.get('path')}",
+                prompt_context=context,
+                source_artifacts=["docs-inventory.json"],
+                evidence=[evidence_from_object("docs-inventory.json", f"pages[{index}]", context)],
+                preferred_record_types=["doc-grounded-qa", "repo-navigation"],
+                example_budget=1,
+            )
+        )
+    return units
+
+
+def build_impact_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
     modules = bundle["ts_deps"]["cruiseResult"]["modules"]
     candidate_modules = []
     for module in modules:
@@ -462,29 +747,43 @@ def build_dependency_units(bundle: dict[str, Any], limit: int) -> list[Generatio
         if not isinstance(source, str) or "/" not in source:
             continue
         dependencies = module.get("dependencies", [])
-        dependents = module.get("dependents", [])
+        local_dependencies = [
+            dependency.get("resolved")
+            for dependency in dependencies
+            if isinstance(dependency, dict)
+            and isinstance(dependency.get("resolved"), str)
+            and not dependency.get("coreModule", False)
+        ]
+        dependents = [dependent for dependent in module.get("dependents", []) if isinstance(dependent, str)]
+        if len(local_dependencies) == 0 and len(dependents) < 2:
+            continue
         candidate_modules.append(
             {
                 "source": source,
-                "dependencyCount": len(dependencies),
+                "area": source.split("/", 1)[0],
+                "dependencyCount": len(local_dependencies),
                 "dependentCount": len(dependents),
-                "dependencies": dependencies[:8],
-                "dependents": dependents[:8],
+                "localDependencies": local_dependencies[:6],
+                "dependents": dependents[:6],
+                "dependentAreas": sorted({dependent.split("/", 1)[0] for dependent in dependents if "/" in dependent}),
                 "orphan": module.get("orphan"),
             }
         )
-
     selected = sorted(
         candidate_modules,
-        key=lambda module: (-module["dependentCount"], -module["dependencyCount"], module["source"]),
+        key=lambda module: (
+            -module["dependentCount"],
+            -module["dependencyCount"],
+            module["source"],
+        ),
     )[:limit]
-
     units = []
     for index, module in enumerate(selected):
         units.append(
-            GenerationUnit(
+            make_unit(
                 unit_id=f"dep-{slugify(module['source'])}",
                 unit_type="dependency-module",
+                signal_bucket="impact",
                 title=f"Dependency module {module['source']}",
                 prompt_context=module,
                 source_artifacts=["ts-deps.json"],
@@ -494,6 +793,82 @@ def build_dependency_units(bundle: dict[str, Any], limit: int) -> list[Generatio
             )
         )
     return units
+
+
+def build_curated_symbol_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
+    symbol_summary = bundle.get("symbol_summary")
+    if not isinstance(symbol_summary, dict):
+        return []
+    artifact_name = "symbol-summary.json" if symbol_summary.get("source") != "derived-from-tags" else "tags.json"
+    important_paths = symbol_summary.get("importantPaths", [])[:limit]
+    units = []
+    for index, path_summary in enumerate(important_paths):
+        context = {
+            "path": path_summary.get("path"),
+            "symbolCount": path_summary.get("symbolCount"),
+            "sampleSymbols": path_summary.get("sampleSymbols", [])[:6],
+        }
+        units.append(
+            make_unit(
+                unit_id=f"symbol-{slugify(path_summary.get('path') or str(index))}",
+                unit_type="symbol-path",
+                signal_bucket="symbol",
+                title=f"Symbol path {path_summary.get('path')}",
+                prompt_context=context,
+                source_artifacts=[artifact_name],
+                evidence=[evidence_from_object(artifact_name, f"importantPaths[{index}]", context)],
+                preferred_record_types=["repo-navigation", "repo-facts"],
+                example_budget=1,
+            )
+        )
+    return units
+
+
+def build_topology_owner_units(bundle: dict[str, Any]) -> list[GenerationUnit]:
+    owner_map = bundle.get("ts_topology_owner_map")
+    if not isinstance(owner_map, dict):
+        return []
+    units = []
+    for index, record in enumerate((owner_map.get("records") or [])[:12]):
+        context = {
+            "symbol": first_present(record, "canonicalKey", "publicSpecifiers", default="<unknown>"),
+            "declarationPath": record.get("declarationPath"),
+            "productionOwners": record.get("productionOwners", [])[:6],
+            "productionExtensions": record.get("productionExtensions", [])[:6],
+            "productionPackages": record.get("productionPackages", [])[:6],
+        }
+        units.append(
+            make_unit(
+                unit_id=f"owner-map-{index}",
+                unit_type="topology-owner",
+                signal_bucket="ownership",
+                title=f"Ownership map {index + 1}",
+                prompt_context=context,
+                source_artifacts=["ts-topology-owner-map.json"],
+                evidence=[evidence_from_object("ts-topology-owner-map.json", f"records[{index}]", context)],
+                preferred_record_types=["repo-facts", "repo-navigation", "architecture-explanations"],
+                example_budget=2,
+            )
+        )
+    return units
+
+
+def first_present(record: dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        value = record.get(key)
+        if value:
+            return value
+    return default
+
+
+def doc_priority(page: dict[str, Any]) -> tuple[int, int]:
+    path = str(page.get("path") or "")
+    title = str(page.get("title") or "")
+    structural_boost = 0
+    for token in ("plugins", "architecture", "gateway", "channels", "concepts", "install", "configuration"):
+        if token in path or token in title.lower():
+            structural_boost -= 1
+    return (structural_boost, -(len(page.get("links", [])) + len(page.get("headings", []))))
 
 
 def call_helper_endpoint(
@@ -540,42 +915,108 @@ def build_helper_prompt(unit: GenerationUnit) -> str:
             }
         ]
     }
+    contract = helper_contract_for_unit(unit)
+    compact_unit = {
+        "id": unit.unit_id,
+        "t": unit.unit_type,
+        "b": unit.signal_bucket,
+        "title": unit.title,
+        "ctx": unit.prompt_context,
+        "ev": [
+            {
+                "a": evidence.artifact,
+                "l": evidence.locator,
+                "x": evidence.excerpt,
+            }
+            for evidence in unit.evidence
+        ],
+    }
     return textwrap.dedent(
         f"""
-        You are generating grounded synthetic training-data examples for repository understanding.
+        Generate grounded repository-training examples.
 
-        Constraints:
-        - Use only the supplied evidence and context.
-        - Do not invent files, symbols, packages, plugins, workflows, or relationships.
-        - Keep outputs concise, factual, and machine-parseable.
+        Rules:
+        - Use only the supplied unit.
+        - No invented files, symbols, packages, plugins, workflows, or relationships.
+        - Keep examples short, factual, and scoped to this unit only.
         - Return JSON only.
         - Produce at most {unit.example_budget} examples.
-        - Allowed record_type values: {sorted(unit.preferred_record_types)}.
-        - Allowed confidence values: ["high", "medium", "low"].
-        - Do not include evidence or source_artifacts fields; they will be attached later.
-        - Favor examples that improve a model's factual competence about this repository.
+        - Allowed record_type: {sorted(unit.preferred_record_types)}.
+        - Allowed confidence: ["high", "medium", "low"].
+        - Do not include evidence or source_artifacts fields.
+
+        Unit contract:
+        {json.dumps(contract, indent=2, sort_keys=True)}
 
         Unit:
-        {json.dumps({
-            "unit_id": unit.unit_id,
-            "unit_type": unit.unit_type,
-            "title": unit.title,
-            "preferred_record_types": unit.preferred_record_types,
-            "prompt_context": unit.prompt_context,
-            "evidence": [
-                {
-                    "artifact": evidence.artifact,
-                    "locator": evidence.locator,
-                    "excerpt": evidence.excerpt,
-                }
-                for evidence in unit.evidence
-            ],
-        }, indent=2, sort_keys=True)}
+        {json.dumps(compact_unit, indent=2, sort_keys=True)}
 
         Output schema:
         {json.dumps(schema, indent=2)}
         """
     ).strip()
+
+
+def helper_contract_for_unit(unit: GenerationUnit) -> dict[str, Any]:
+    shared = {
+        "focus": "repo competence through grounded structural facts",
+        "avoid": [
+            "repo-wide claims not supported by the unit",
+            "code-fence trivia",
+            "rephrasing the file path as the answer",
+        ],
+    }
+    by_type = {
+        "repo-summary": {
+            "task": "ownership and high-level repo facts",
+            "ask_for": ["repo-facts", "repo-navigation"],
+        },
+        "workspace-overview": {
+            "task": "workspace ownership and package routing",
+            "ask_for": ["repo-facts", "repo-navigation"],
+        },
+        "plugin": {
+            "task": "plugin ownership, capability location, and boundary explanations",
+            "ask_for": ["repo-facts", "repo-navigation", "architecture-explanations"],
+        },
+        "topology-owner": {
+            "task": "who owns what and where a surface belongs",
+            "ask_for": ["repo-facts", "repo-navigation", "architecture-explanations"],
+        },
+        "repo-topology": {
+            "task": "where to look first in the repo layout",
+            "ask_for": ["repo-navigation", "repo-facts"],
+        },
+        "routing-root": {
+            "task": "directory-level routing and likely lookup starting points",
+            "ask_for": ["repo-navigation", "repo-facts"],
+        },
+        "workflow-routing": {
+            "task": "workflow ownership and where CI behaviors live",
+            "ask_for": ["repo-navigation", "repo-facts"],
+        },
+        "topology-consumer": {
+            "task": "boundary usage and which owners consume a surface",
+            "ask_for": ["repo-navigation", "architecture-explanations"],
+        },
+        "seam-family": {
+            "task": "architectural boundary hotspots and shared seam explanations",
+            "ask_for": ["architecture-explanations", "repo-navigation"],
+        },
+        "dependency-module": {
+            "task": "impact reasoning, dependency paths, and likely affected areas",
+            "ask_for": ["dependency-reasoning", "architecture-explanations", "repo-navigation"],
+        },
+        "doc-page": {
+            "task": "where a topic is documented or where to look in docs",
+            "ask_for": ["doc-grounded-qa", "repo-navigation"],
+        },
+        "symbol-path": {
+            "task": "where major exported surfaces or symbols are located",
+            "ask_for": ["repo-navigation", "repo-facts"],
+        },
+    }
+    return {**shared, **by_type.get(unit.unit_type, {"task": "bounded factual synthesis", "ask_for": unit.preferred_record_types})}
 
 
 def generate_dry_run_examples(unit: GenerationUnit) -> list[dict[str, Any]]:
@@ -627,6 +1068,9 @@ def normalize_records(
         if any(evidence.artifact not in artifact_files for evidence in unit.evidence):
             stats["validation_dropped"] += 1
             continue
+        if is_low_value_record(unit, prompt, response):
+            stats["validation_dropped"] += 1
+            continue
 
         prompt_key = normalize_text(prompt)
         response_key = normalize_text(response)
@@ -661,11 +1105,61 @@ def normalize_records(
                 "unit_id": unit.unit_id,
                 "unit_type": unit.unit_type,
                 "unit_title": unit.title,
+                "signal_bucket": unit.signal_bucket,
                 **(example.get("metadata") if isinstance(example.get("metadata"), dict) else {}),
             },
         }
         normalized.append(record)
     return normalized
+
+
+def is_low_value_record(unit: GenerationUnit, prompt: str, response: str) -> bool:
+    prompt_lower = prompt.lower()
+    response_lower = response.lower()
+    if unit.unit_type == "doc-page":
+        if any(pattern in prompt_lower for pattern in LOW_VALUE_DOC_PATTERNS):
+            return True
+        if any(pattern in response_lower for pattern in LOW_VALUE_DOC_PATTERNS):
+            return True
+        if "repository" in prompt_lower and not any(token in prompt_lower for token in ("document", "docs", "page")):
+            return True
+    if unit.unit_type in {"dependency-module", "symbol-path"}:
+        source_path = str(unit.prompt_context.get("source") or unit.prompt_context.get("path") or "").lower()
+        if source_path and source_path in prompt_lower and any(pattern in response_lower for pattern in LOW_VALUE_RESPONSE_PATTERNS):
+            return True
+    if "total number of files" in prompt_lower or "primary programming language" in prompt_lower:
+        return True
+    if any(pattern in response_lower for pattern in LOW_VALUE_RESPONSE_PATTERNS):
+        return True
+    return False
+
+
+def rebalance_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not records:
+        return records
+    prioritized = sorted(
+        records,
+        key=lambda record: (
+            -BUCKET_PRIORITY.get(record.get("metadata", {}).get("signal_bucket", ""), 0),
+            record.get("record_type", ""),
+            record.get("prompt", ""),
+        ),
+    )
+    total = len(prioritized)
+    cap_by_type = {
+        record_type: max(4, math.ceil(total * ratio))
+        for record_type, ratio in RECORD_TYPE_CAP_RATIO.items()
+    }
+    kept: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for record in prioritized:
+        record_type = record["record_type"]
+        cap = cap_by_type.get(record_type, total)
+        if counts.get(record_type, 0) >= cap:
+            continue
+        kept.append(record)
+        counts[record_type] = counts.get(record_type, 0) + 1
+    return kept
 
 
 def to_chat_sft_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -849,6 +1343,18 @@ def read_json(path: Path) -> Any:
 
 def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def read_optional_json(path: Path) -> Any | None:
+    if not path.is_file():
+        return None
+    return read_json(path)
+
+
+def read_optional_text(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    return read_text(path)
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
