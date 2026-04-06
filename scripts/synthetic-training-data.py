@@ -28,7 +28,7 @@ ALLOWED_RECORD_TYPES = {
 }
 ALLOWED_CONFIDENCE = {"high", "medium", "low"}
 DEFAULT_ENDPOINT = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "synthetic-data-helper"
+DEFAULT_MODEL = "qwen3.5:2b"
 DEFAULT_MIN_RECORDS = 25
 DEFAULT_EVAL_SAMPLE_SIZE = 50
 MAX_EXCERPT_CHARS = 320
