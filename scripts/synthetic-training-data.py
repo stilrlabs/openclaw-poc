@@ -27,7 +27,7 @@ ALLOWED_RECORD_TYPES = {
     "repo-navigation",
 }
 ALLOWED_CONFIDENCE = {"high", "medium", "low"}
-DEFAULT_ENDPOINT = "http://127.0.0.1:11434/api/generate"
+DEFAULT_ENDPOINT = "http://localhost:11434/api/generate"
 DEFAULT_MODEL = "synthetic-data-helper"
 DEFAULT_MIN_RECORDS = 25
 DEFAULT_EVAL_SAMPLE_SIZE = 50

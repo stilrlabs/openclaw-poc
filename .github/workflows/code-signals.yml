@@ -6,6 +6,17 @@ on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
   workflow_dispatch:
+    inputs:
+      helper_endpoint:
+        description: "Local helper endpoint URL"
+        required: false
+        default: "http://localhost:11434/api/generate"
+        type: string
+      helper_model:
+        description: "Local helper model name"
+        required: false
+        default: "synthetic-data-helper"
+        type: string
 
 permissions:
   contents: read
@@ -55,5 +66,44 @@ jobs:
         with:
           name: code-signals-${{ github.sha }}
           path: .artifacts/code-signals/${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+
+  synthetic-training-data:
+    needs: [code-signals]
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 60
+    env:
+      SYNTHETIC_HELPER_ENDPOINT: ${{ github.event.inputs.helper_endpoint || 'http://localhost:11434/api/generate' }}
+      SYNTHETIC_HELPER_MODEL: ${{ github.event.inputs.helper_model || 'synthetic-data-helper' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+
+      - name: Download signal bundle
+        uses: actions/download-artifact@v8
+        with:
+          name: code-signals-${{ github.sha }}
+          path: .artifacts/code-signals-input
+
+      - name: Generate synthetic training-data artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/synthetic-training-data.py generate \
+            --input-dir ".artifacts/code-signals-input" \
+            --out-dir ".artifacts/synthetic-training-data/${{ github.sha }}"
+
+      - name: Upload synthetic training-data artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: synthetic-training-data-${{ github.sha }}
+          path: .artifacts/synthetic-training-data/${{ github.sha }}
           if-no-files-found: error
           retention-days: 7
