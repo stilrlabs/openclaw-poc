@@ -10,7 +10,7 @@ on:
       helper_endpoint:
         description: "Local helper endpoint URL"
         required: false
-        default: "http://localhost:11434/api/generate"
+        default: "http://localhost:11434/api/chat"
         type: string
       helper_model:
         description: "Local helper model name"
@@ -75,7 +75,7 @@ jobs:
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 60
     env:
-      SYNTHETIC_HELPER_ENDPOINT: ${{ github.event.inputs.helper_endpoint || 'http://localhost:11434/api/generate' }}
+      SYNTHETIC_HELPER_ENDPOINT: ${{ github.event.inputs.helper_endpoint || 'http://localhost:11434/api/chat' }}
       SYNTHETIC_HELPER_MODEL: ${{ github.event.inputs.helper_model || 'qwen3.5:2b' }}
     steps:
       - name: Checkout

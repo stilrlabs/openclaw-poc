@@ -27,7 +27,7 @@ ALLOWED_RECORD_TYPES = {
     "repo-navigation",
 }
 ALLOWED_CONFIDENCE = {"high", "medium", "low"}
-DEFAULT_ENDPOINT = "http://localhost:11434/api/generate"
+DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen3.5:2b"
 DEFAULT_MIN_RECORDS = 25
 DEFAULT_EVAL_SAMPLE_SIZE = 50
@@ -507,13 +507,21 @@ def call_helper_endpoint(
     prompt = build_helper_prompt(unit)
     payload = {
         "model": helper_model,
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
+        "think": False,
         "stream": False,
         "format": "json",
         "options": {"temperature": helper_temperature},
     }
     response = http_post_json(helper_endpoint, payload, timeout_seconds=helper_timeout_seconds)
-    response_text = response.get("response", "")
+    response_text = ""
+    message = response.get("message")
+    if isinstance(message, dict):
+        response_text = str(message.get("content", "")).strip()
+    if not response_text:
+        response_text = str(response.get("response", "")).strip()
+    if not response_text:
+        response_text = str(response.get("thinking", "")).strip()
     parsed = parse_json_block(response_text)
     if not isinstance(parsed, dict) or not isinstance(parsed.get("examples"), list):
         raise ValueError(f"Helper response for unit {unit.unit_id} did not contain an examples array.")
