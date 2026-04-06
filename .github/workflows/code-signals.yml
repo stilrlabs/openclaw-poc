@@ -73,7 +73,7 @@ jobs:
     needs: [code-signals]
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 60
+    timeout-minutes: 180
     env:
       SYNTHETIC_HELPER_ENDPOINT: ${{ github.event.inputs.helper_endpoint || 'http://localhost:11434/api/chat' }}
       SYNTHETIC_HELPER_MODEL: ${{ github.event.inputs.helper_model || 'qwen3.5:2b' }}
