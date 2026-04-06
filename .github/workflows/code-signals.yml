@@ -1,0 +1,59 @@
+name: Code Signals
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  code-signals:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+
+      - name: Setup Node environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          install-bun: "false"
+          use-sticky-disk: "false"
+
+      - name: Install system analyzers
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cloc python3-yaml tree universal-ctags
+
+      - name: Generate signal bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/code-signals.py --out-dir ".artifacts/code-signals/${{ github.sha }}"
+
+      - name: Upload signal bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: code-signals-${{ github.sha }}
+          path: .artifacts/code-signals/${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
