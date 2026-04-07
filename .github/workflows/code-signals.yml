@@ -111,9 +111,15 @@ jobs:
       # runner passes a Windows temp .sh path (backslashes stripped → "C:Users..." not found).
       - name: Generate synthetic training-data artifact (Windows)
         if: runner.os == 'Windows'
-        shell: pwsh
+        # Use built-in Windows PowerShell (pwsh/PowerShell 7 is often not installed on self-hosted agents).
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          # Runner service often inherits a minimal PATH; reload Machine + User PATH from registry
+          # so Python matches an interactive session (common self-hosted Windows issue).
+          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $env:Path = (@($machinePath, $userPath, $env:Path) -join ';')
           $args = @(
             'scripts/synthetic-training-data.py', 'generate',
             '--input-dir', '.artifacts/code-signals-input',
@@ -123,8 +129,10 @@ jobs:
             & python3 @args
           } elseif (Get-Command python -ErrorAction SilentlyContinue) {
             & python @args
+          } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+            & py -3 @args
           } else {
-            Write-Error 'Neither python3 nor python found on PATH'
+            Write-Error 'Neither python3, python, nor py -3 found on PATH (after refreshing Machine/User PATH)'
             exit 1
           }
 
