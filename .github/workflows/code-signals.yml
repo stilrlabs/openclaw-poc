@@ -107,7 +107,29 @@ jobs:
           name: code-signals-${{ github.sha }}
           path: .artifacts/code-signals-input
 
-      - name: Generate synthetic training-data artifact
+      # Windows: avoid shell: bash here — Git Bash often breaks on self-hosted runners when the
+      # runner passes a Windows temp .sh path (backslashes stripped → "C:Users..." not found).
+      - name: Generate synthetic training-data artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $args = @(
+            'scripts/synthetic-training-data.py', 'generate',
+            '--input-dir', '.artifacts/code-signals-input',
+            '--out-dir', '.artifacts/synthetic-training-data/${{ github.sha }}'
+          )
+          if (Get-Command python3 -ErrorAction SilentlyContinue) {
+            & python3 @args
+          } elseif (Get-Command python -ErrorAction SilentlyContinue) {
+            & python @args
+          } else {
+            Write-Error 'Neither python3 nor python found on PATH'
+            exit 1
+          }
+
+      - name: Generate synthetic training-data artifact (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
