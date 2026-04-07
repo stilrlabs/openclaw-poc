@@ -125,14 +125,16 @@ jobs:
             '--input-dir', '.artifacts/code-signals-input',
             '--out-dir', '.artifacts/synthetic-training-data/${{ github.sha }}'
           )
-          if (Get-Command python3 -ErrorAction SilentlyContinue) {
-            & python3 @args
+          # Prefer py -3 and `python` before `python3`: on Windows, python3.exe in WindowsApps is often
+          # a Store stub and fails in automation; the real install is usually py.exe / Python3x\python.exe.
+          if (Get-Command py -ErrorAction SilentlyContinue) {
+            & py -3 @args
           } elseif (Get-Command python -ErrorAction SilentlyContinue) {
             & python @args
-          } elseif (Get-Command py -ErrorAction SilentlyContinue) {
-            & py -3 @args
+          } elseif (Get-Command python3 -ErrorAction SilentlyContinue) {
+            & python3 @args
           } else {
-            Write-Error 'Neither python3, python, nor py -3 found on PATH (after refreshing Machine/User PATH)'
+            Write-Error 'Neither py -3, python, nor python3 found on PATH (after refreshing Machine/User PATH)'
             exit 1
           }
 
