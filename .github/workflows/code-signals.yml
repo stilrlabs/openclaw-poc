@@ -17,6 +17,14 @@ on:
         required: false
         default: "qwen3.5:2b"
         type: string
+      synthetic_runner:
+        description: "Self-hosted runner for synthetic-training-data (labels must match your agent)"
+        required: false
+        default: windows
+        type: choice
+        options:
+          - windows
+          - macos
 
 permissions:
   contents: read
@@ -72,7 +80,14 @@ jobs:
   synthetic-training-data:
     needs: [code-signals]
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
-    runs-on: [self-hosted, macOS, ARM64]
+    # Default: Windows self-hosted first. Manual runs can pick macos. Label sets must match
+    # your runner registration (see GitHub: Settings → Actions → Runners → each runner's labels).
+    runs-on: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.synthetic_runner == 'macos')
+        && fromJSON('["self-hosted", "macOS", "ARM64"]')
+        || fromJSON('["self-hosted", "Windows", "X64"]')
+      }}
     timeout-minutes: 180
     env:
       SYNTHETIC_HELPER_ENDPOINT: ${{ github.event.inputs.helper_endpoint || 'http://localhost:11434/api/chat' }}
@@ -96,7 +111,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 scripts/synthetic-training-data.py generate \
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          else echo "Neither python3 nor python found on PATH"; exit 1; fi
+          "$PY" scripts/synthetic-training-data.py generate \
             --input-dir ".artifacts/code-signals-input" \
             --out-dir ".artifacts/synthetic-training-data/${{ github.sha }}"
 
