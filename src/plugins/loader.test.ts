@@ -13,6 +13,7 @@ import {
   clearPluginLoaderCache,
   loadOpenClawPlugins,
   PluginLoadReentryError,
+  resolveRuntimePluginRegistry,
 } from "./loader.js";
 import {
   cleanupPluginLoaderFixturesForTest,
@@ -1251,6 +1252,60 @@ module.exports = { id: "throws-after-import", register() {} };`,
         } finally {
           Reflect.deleteProperty(globalThis, marker);
           Reflect.deleteProperty(globalThis, reenterFnMarker);
+        }
+      },
+    },
+    {
+      label: "lets resolveRuntimePluginRegistry short-circuit during same snapshot load",
+      run: () => {
+        useNoBundledPlugins();
+        const marker = "__openclaw_runtime_registry_reentry_marker";
+        const resolverMarker = "__openclaw_runtime_registry_reentry_fn";
+        Reflect.deleteProperty(globalThis, marker);
+        Reflect.set(
+          globalThis,
+          resolverMarker,
+          (options: Parameters<typeof resolveRuntimePluginRegistry>[0]) =>
+            resolveRuntimePluginRegistry(options),
+        );
+        const pluginDir = makeTempDir();
+        const pluginFile = path.join(pluginDir, "runtime-registry-reentry.cjs");
+        const nestedOptions = {
+          cache: false,
+          activate: false,
+          workspaceDir: pluginDir,
+          config: {
+            plugins: {
+              load: { paths: [pluginFile] },
+              allow: ["runtime-registry-reentry"],
+            },
+          },
+        } satisfies Parameters<typeof loadOpenClawPlugins>[0];
+        writePlugin({
+          id: "runtime-registry-reentry",
+          dir: pluginDir,
+          filename: "runtime-registry-reentry.cjs",
+          body: `module.exports = {
+  id: "runtime-registry-reentry",
+  register() {
+    const registry = globalThis.${resolverMarker}(${JSON.stringify(nestedOptions)});
+    globalThis.${marker} = registry === undefined ? "undefined" : "loaded";
+  },
+};`,
+        });
+
+        const registry = loadOpenClawPlugins(nestedOptions);
+
+        try {
+          expect(Reflect.get(globalThis, marker)).toBe("undefined");
+          expect(
+            registry.plugins.find((entry) => entry.id === "runtime-registry-reentry"),
+          ).toMatchObject({
+            status: "loaded",
+          });
+        } finally {
+          Reflect.deleteProperty(globalThis, marker);
+          Reflect.deleteProperty(globalThis, resolverMarker);
         }
       },
     },
@@ -2760,38 +2815,6 @@ module.exports = {
       expectedChannels: 1,
     },
     {
-      name: "can prefer setupEntry for configured channel loads during startup",
-      fixture: {
-        id: "setup-runtime-preferred-test",
-        label: "Setup Runtime Preferred Test",
-        packageName: "@openclaw/setup-runtime-preferred-test",
-        fullBlurb: "full entry should be deferred while startup is still cold",
-        setupBlurb: "setup runtime preferred",
-        configured: true,
-        startupDeferConfiguredChannelFullLoadUntilAfterListen: true,
-      },
-      load: ({ pluginDir }: { pluginDir: string }) =>
-        loadOpenClawPlugins({
-          cache: false,
-          preferSetupRuntimeForChannelPlugins: true,
-          config: {
-            channels: {
-              "setup-runtime-preferred-test": {
-                enabled: true,
-                token: "configured",
-              },
-            },
-            plugins: {
-              load: { paths: [pluginDir] },
-              allow: ["setup-runtime-preferred-test"],
-            },
-          },
-        }),
-      expectFullLoaded: false,
-      expectSetupLoaded: true,
-      expectedChannels: 1,
-    },
-    {
       name: "does not prefer setupEntry for configured channel loads without startup opt-in",
       fixture: {
         id: "setup-runtime-not-preferred-test",
@@ -2830,6 +2853,26 @@ module.exports = {
     expect(fs.existsSync(built.setupMarker)).toBe(expectSetupLoaded);
     expect(registry.channelSetups).toHaveLength(1);
     expect(registry.channels).toHaveLength(expectedChannels);
+  });
+
+  it("prefers setupEntry for configured channel loads during startup when opted in", () => {
+    expect(
+      __testing.shouldLoadChannelPluginInSetupRuntime({
+        manifestChannels: ["setup-runtime-preferred-test"],
+        setupSource: "./setup-entry.cjs",
+        startupDeferConfiguredChannelFullLoadUntilAfterListen: true,
+        cfg: {
+          channels: {
+            "setup-runtime-preferred-test": {
+              enabled: true,
+              token: "configured",
+            },
+          },
+        },
+        env: {},
+        preferSetupRuntimeForChannelPlugins: true,
+      }),
+    ).toBe(true);
   });
 
   it("blocks before_prompt_build but preserves legacy model overrides when prompt injection is disabled", async () => {

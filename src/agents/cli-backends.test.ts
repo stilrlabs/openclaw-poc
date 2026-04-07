@@ -1,9 +1,12 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import type { CliBackendConfig } from "../config/types.js";
-import { createEmptyPluginRegistry } from "../plugins/registry.js";
-import { setActivePluginRegistry } from "../plugins/runtime.js";
-import { normalizeClaudeBackendConfig, resolveCliBackendConfig } from "./cli-backends.js";
+
+let createEmptyPluginRegistry: typeof import("../plugins/registry.js").createEmptyPluginRegistry;
+let setActivePluginRegistry: typeof import("../plugins/runtime.js").setActivePluginRegistry;
+let normalizeClaudeBackendConfig: typeof import("./cli-backends.js").normalizeClaudeBackendConfig;
+let resolveCliBackendConfig: typeof import("./cli-backends.js").resolveCliBackendConfig;
+let resolveCliBackendLiveTest: typeof import("./cli-backends.js").resolveCliBackendLiveTest;
 
 function createBackendEntry(params: {
   pluginId: string;
@@ -20,11 +23,47 @@ function createBackendEntry(params: {
       config: params.config,
       ...(params.bundleMcp ? { bundleMcp: params.bundleMcp } : {}),
       ...(params.normalizeConfig ? { normalizeConfig: params.normalizeConfig } : {}),
+      liveTest: {
+        defaultModelRef:
+          params.id === "claude-cli"
+            ? "claude-cli/claude-sonnet-4-6"
+            : params.id === "codex-cli"
+              ? "codex-cli/gpt-5.4"
+              : params.id === "google-gemini-cli"
+                ? "google-gemini-cli/gemini-3.1-pro-preview"
+                : undefined,
+        defaultImageProbe: true,
+        docker: {
+          npmPackage:
+            params.id === "claude-cli"
+              ? "@anthropic-ai/claude-code"
+              : params.id === "codex-cli"
+                ? "@openai/codex"
+                : params.id === "google-gemini-cli"
+                  ? "@google/gemini-cli"
+                  : undefined,
+          binaryName:
+            params.id === "claude-cli"
+              ? "claude"
+              : params.id === "codex-cli"
+                ? "codex"
+                : params.id === "google-gemini-cli"
+                  ? "gemini"
+                  : undefined,
+        },
+      },
     },
   };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  vi.doUnmock("../plugins/setup-registry.js");
+  vi.doUnmock("../plugins/cli-backends.runtime.js");
+  vi.resetModules();
+  ({ createEmptyPluginRegistry } = await import("../plugins/registry.js"));
+  ({ setActivePluginRegistry } = await import("../plugins/runtime.js"));
+  ({ normalizeClaudeBackendConfig, resolveCliBackendConfig, resolveCliBackendLiveTest } =
+    await import("./cli-backends.js"));
   const registry = createEmptyPluginRegistry();
   registry.cliBackends = [
     createBackendEntry({
@@ -95,16 +134,7 @@ beforeEach(() => {
           "workspace-write",
           "--skip-git-repo-check",
         ],
-        resumeArgs: [
-          "exec",
-          "resume",
-          "{sessionId}",
-          "--color",
-          "never",
-          "--sandbox",
-          "workspace-write",
-          "--skip-git-repo-check",
-        ],
+        resumeArgs: ["exec", "resume", "{sessionId}", "--dangerously-bypass-approvals-and-sandbox"],
         reliability: {
           watchdog: {
             fresh: {
@@ -127,8 +157,8 @@ beforeEach(() => {
       bundleMcp: false,
       config: {
         command: "gemini",
-        args: ["--prompt", "--output-format", "json"],
-        resumeArgs: ["--resume", "{sessionId}", "--prompt", "--output-format", "json"],
+        args: ["--output-format", "json", "--prompt", "{prompt}"],
+        resumeArgs: ["--resume", "{sessionId}", "--output-format", "json", "--prompt", "{prompt}"],
         modelArg: "--model",
         sessionMode: "existing",
         sessionIdFields: ["session_id", "sessionId"],
@@ -157,11 +187,7 @@ describe("resolveCliBackendConfig reliability merge", () => {
       "exec",
       "resume",
       "{sessionId}",
-      "--color",
-      "never",
-      "--sandbox",
-      "workspace-write",
-      "--skip-git-repo-check",
+      "--dangerously-bypass-approvals-and-sandbox",
     ]);
   });
 
@@ -194,6 +220,26 @@ describe("resolveCliBackendConfig reliability merge", () => {
     expect(resolved?.config.reliability?.watchdog?.resume?.minMs).toBe(60_000);
     expect(resolved?.config.reliability?.watchdog?.resume?.maxMs).toBe(180_000);
     expect(resolved?.config.reliability?.watchdog?.fresh?.noOutputTimeoutRatio).toBe(0.8);
+  });
+});
+
+describe("resolveCliBackendLiveTest", () => {
+  it("returns plugin-owned live smoke metadata for codex", () => {
+    expect(resolveCliBackendLiveTest("codex-cli")).toEqual({
+      defaultModelRef: "codex-cli/gpt-5.4",
+      defaultImageProbe: true,
+      dockerNpmPackage: "@openai/codex",
+      dockerBinaryName: "codex",
+    });
+  });
+
+  it("returns plugin-owned live smoke metadata for gemini", () => {
+    expect(resolveCliBackendLiveTest("google-gemini-cli")).toEqual({
+      defaultModelRef: "google-gemini-cli/gemini-3.1-pro-preview",
+      defaultImageProbe: true,
+      dockerNpmPackage: "@google/gemini-cli",
+      dockerBinaryName: "gemini",
+    });
   });
 });
 
@@ -577,13 +623,14 @@ describe("resolveCliBackendConfig google-gemini-cli defaults", () => {
 
     expect(resolved).not.toBeNull();
     expect(resolved?.bundleMcp).toBe(false);
-    expect(resolved?.config.args).toEqual(["--prompt", "--output-format", "json"]);
+    expect(resolved?.config.args).toEqual(["--output-format", "json", "--prompt", "{prompt}"]);
     expect(resolved?.config.resumeArgs).toEqual([
       "--resume",
       "{sessionId}",
-      "--prompt",
       "--output-format",
       "json",
+      "--prompt",
+      "{prompt}",
     ]);
     expect(resolved?.config.modelArg).toBe("--model");
     expect(resolved?.config.sessionMode).toBe("existing");

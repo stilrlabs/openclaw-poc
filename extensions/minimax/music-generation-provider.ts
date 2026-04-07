@@ -12,6 +12,7 @@ import {
   postJsonRequest,
   resolveProviderHttpRequestConfig,
 } from "openclaw/plugin-sdk/provider-http";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
 
 const DEFAULT_MINIMAX_MUSIC_BASE_URL = "https://api.minimax.io";
 const DEFAULT_MINIMAX_MUSIC_MODEL = "music-2.5+";
@@ -38,7 +39,7 @@ type MinimaxMusicCreateResponse = {
 function resolveMinimaxMusicBaseUrl(
   cfg: Parameters<typeof resolveApiKeyForProvider>[0]["cfg"],
 ): string {
-  const direct = cfg?.models?.providers?.minimax?.baseUrl?.trim();
+  const direct = normalizeOptionalString(cfg?.models?.providers?.minimax?.baseUrl);
   if (!direct) {
     return DEFAULT_MINIMAX_MUSIC_BASE_URL;
   }
@@ -77,6 +78,11 @@ function decodePossibleText(data: string): string {
   return trimmed;
 }
 
+function isLikelyRemoteUrl(value: string | undefined): boolean {
+  const trimmed = normalizeOptionalString(value);
+  return Boolean(trimmed && /^https?:\/\//iu.test(trimmed));
+}
+
 async function downloadTrackFromUrl(params: {
   url: string;
   timeoutMs?: number;
@@ -104,6 +110,14 @@ function buildPrompt(req: MusicGenerationRequest): string {
     parts.push(`Target duration: about ${Math.max(1, Math.round(req.durationSeconds))} seconds.`);
   }
   return parts.join("\n\n");
+}
+
+function resolveMinimaxMusicModel(model: string | undefined): string {
+  const trimmed = normalizeOptionalString(model);
+  if (!trimmed) {
+    return DEFAULT_MINIMAX_MUSIC_MODEL;
+  }
+  return trimmed;
 }
 
 export function buildMinimaxMusicGenerationProvider(): MusicGenerationProvider {
@@ -161,26 +175,27 @@ export function buildMinimaxMusicGenerationProvider(): MusicGenerationProvider {
             Authorization: `Bearer ${auth.apiKey}`,
           },
         });
+      const jsonHeaders = new Headers(headers);
+      jsonHeaders.set("Content-Type", "application/json");
 
-      const model = req.model?.trim() || DEFAULT_MINIMAX_MUSIC_MODEL;
+      const model = resolveMinimaxMusicModel(req.model);
+      const lyrics = req.lyrics?.trim();
       const body = {
         model,
         prompt: buildPrompt(req),
         ...(req.instrumental === true ? { is_instrumental: true } : {}),
-        ...(req.lyrics?.trim()
-          ? { lyrics: req.lyrics.trim() }
-          : req.instrumental === true
-            ? {}
-            : { lyrics_optimizer: true }),
+        ...(lyrics ? { lyrics } : req.instrumental === true ? {} : { lyrics_optimizer: true }),
         output_format: "url",
         audio_setting: {
+          sample_rate: 44_100,
+          bitrate: 256_000,
           format: "mp3",
         },
       };
 
       const { response: res, release } = await postJsonRequest({
         url: `${baseUrl}/v1/music_generation`,
-        headers,
+        headers: jsonHeaders,
         body,
         timeoutMs: req.timeoutMs ?? DEFAULT_TIMEOUT_MS,
         fetchFn,
@@ -194,8 +209,12 @@ export function buildMinimaxMusicGenerationProvider(): MusicGenerationProvider {
         const payload = (await res.json()) as MinimaxMusicCreateResponse;
         assertMinimaxBaseResp(payload.base_resp, "MiniMax music generation failed");
 
-        const audioUrl = payload.audio_url?.trim() || payload.data?.audio_url?.trim();
-        const inlineAudio = payload.audio?.trim() || payload.data?.audio?.trim();
+        const audioCandidate = payload.audio?.trim() || payload.data?.audio?.trim();
+        const audioUrl =
+          payload.audio_url?.trim() ||
+          payload.data?.audio_url?.trim() ||
+          (isLikelyRemoteUrl(audioCandidate) ? audioCandidate : undefined);
+        const inlineAudio = isLikelyRemoteUrl(audioCandidate) ? undefined : audioCandidate;
         const lyrics = decodePossibleText(payload.lyrics ?? payload.data?.lyrics ?? "");
 
         const track = audioUrl
@@ -223,7 +242,7 @@ export function buildMinimaxMusicGenerationProvider(): MusicGenerationProvider {
             ...(payload.task_id?.trim() ? { taskId: payload.task_id.trim() } : {}),
             ...(audioUrl ? { audioUrl } : {}),
             instrumental: req.instrumental === true,
-            ...(req.lyrics?.trim() ? { requestedLyrics: true } : {}),
+            ...(lyrics ? { requestedLyrics: true } : {}),
             ...(typeof req.durationSeconds === "number"
               ? { requestedDurationSeconds: req.durationSeconds }
               : {}),

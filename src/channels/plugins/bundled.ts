@@ -1,5 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatErrorMessage } from "../../infra/errors.js";
 import { resolveOpenClawPackageRootSync } from "../../infra/openclaw-root.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type {
@@ -105,19 +106,13 @@ function resolveGeneratedBundledChannelModulePath(params: {
   if (!params.entry) {
     return null;
   }
-  const candidateRoots = [
-    path.resolve(OPENCLAW_PACKAGE_ROOT, "dist", "extensions", params.metadata.dirName),
-    path.resolve(OPENCLAW_PACKAGE_ROOT, "extensions", params.metadata.dirName),
-  ];
-  for (const rootDir of candidateRoots) {
-    const resolved = resolveBundledChannelGeneratedPath(
-      rootDir,
-      params.entry,
-      params.metadata.dirName,
-    );
-    if (resolved) {
-      return resolved;
-    }
+  const resolved = resolveBundledChannelGeneratedPath(
+    OPENCLAW_PACKAGE_ROOT,
+    params.entry,
+    params.metadata.dirName,
+  );
+  if (resolved) {
+    return resolved;
   }
   return null;
 }
@@ -183,7 +178,7 @@ function loadGeneratedBundledChannelEntries(): readonly GeneratedBundledChannelE
         ...(setupEntry ? { setupEntry } : {}),
       });
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = formatErrorMessage(error);
       log.warn(`[channels] failed to load bundled channel ${metadata.manifest.id}: ${detail}`);
     }
   }

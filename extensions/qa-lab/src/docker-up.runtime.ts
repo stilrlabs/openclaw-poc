@@ -36,7 +36,7 @@ async function isPortFree(port: number) {
   return await new Promise<boolean>((resolve) => {
     const server = createServer();
     server.once("error", () => resolve(false));
-    server.listen(port, () => {
+    server.listen(port, "127.0.0.1", () => {
       server.close(() => resolve(true));
     });
   });
@@ -112,15 +112,18 @@ async function execCommand(command: string, args: string[], cwd: string) {
 async function waitForHealth(
   url: string,
   deps: {
+    label?: string;
+    composeFile?: string;
     fetchImpl: FetchLike;
     sleepImpl: (ms: number) => Promise<unknown>;
     timeoutMs?: number;
     pollMs?: number;
   },
 ) {
-  const timeoutMs = deps.timeoutMs ?? 120_000;
+  const timeoutMs = deps.timeoutMs ?? 360_000;
   const pollMs = deps.pollMs ?? 1_000;
-  const deadline = Date.now() + timeoutMs;
+  const startMs = Date.now();
+  const deadline = startMs + timeoutMs;
   let lastError: unknown = null;
 
   while (Date.now() < deadline) {
@@ -136,9 +139,103 @@ async function waitForHealth(
     await deps.sleepImpl(pollMs);
   }
 
+  const elapsedSec = Math.round((Date.now() - startMs) / 1000);
+  const service = deps.label ?? url;
+  const lines = [
+    `${service} did not become healthy within ${elapsedSec}s (limit ${Math.round(timeoutMs / 1000)}s).`,
+    lastError ? `Last error: ${describeError(lastError)}` : "",
+    `Hint: check container logs with \`docker compose -f ${deps.composeFile ?? "<compose-file>"} logs\` and verify the port is not already in use.`,
+  ];
+  throw new Error(lines.filter(Boolean).join("\n"));
+}
+
+async function isHealthy(url: string, fetchImpl: FetchLike) {
+  try {
+    const response = await fetchImpl(url);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForDockerServiceHealth(
+  service: string,
+  composeFile: string,
+  repoRoot: string,
+  runCommand: RunCommand,
+  sleepImpl: (ms: number) => Promise<unknown>,
+  timeoutMs = 360_000,
+  pollMs = 1_000,
+) {
+  const startMs = Date.now();
+  const deadline = startMs + timeoutMs;
+  let lastStatus = "unknown";
+
+  while (Date.now() < deadline) {
+    try {
+      const { stdout } = await runCommand(
+        "docker",
+        ["compose", "-f", composeFile, "ps", "--format", "json", service],
+        repoRoot,
+      );
+      const rows = stdout
+        .trim()
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { Health?: string; State?: string });
+      const row = rows[0];
+      lastStatus = row?.Health ?? row?.State ?? "unknown";
+      if (lastStatus === "healthy" || lastStatus === "running") {
+        return;
+      }
+    } catch (error) {
+      lastStatus = describeError(error);
+    }
+    await sleepImpl(pollMs);
+  }
+
+  const elapsedSec = Math.round((Date.now() - startMs) / 1000);
   throw new Error(
-    `Timed out waiting for ${url}${lastError ? `: ${describeError(lastError)}` : ""}`,
+    [
+      `${service} did not become healthy within ${elapsedSec}s (limit ${Math.round(timeoutMs / 1000)}s).`,
+      `Last status: ${lastStatus}`,
+      `Hint: check container logs with \`docker compose -f ${composeFile} logs ${service}\`.`,
+    ].join("\n"),
   );
+}
+
+async function resolveComposeServiceUrl(
+  service: string,
+  port: number,
+  composeFile: string,
+  repoRoot: string,
+  runCommand: RunCommand,
+) {
+  const { stdout: containerStdout } = await runCommand(
+    "docker",
+    ["compose", "-f", composeFile, "ps", "-q", service],
+    repoRoot,
+  );
+  const containerId = containerStdout.trim();
+  if (!containerId) {
+    return null;
+  }
+  const { stdout: ipStdout } = await runCommand(
+    "docker",
+    [
+      "inspect",
+      "--format",
+      "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+      containerId,
+    ],
+    repoRoot,
+  );
+  const ip = ipStdout.trim();
+  if (!ip) {
+    return null;
+  }
+  return `http://${ip}:${port}/`;
 }
 
 export async function runQaDockerUp(
@@ -189,6 +286,19 @@ export async function runQaDockerUp(
   });
 
   const composeFile = path.join(outputDir, "docker-compose.qa.yml");
+
+  // Tear down any previous stack from this compose file so ports are freed
+  // and we get a clean restart every time.
+  try {
+    await runCommand(
+      "docker",
+      ["compose", "-f", composeFile, "down", "--remove-orphans"],
+      repoRoot,
+    );
+  } catch {
+    // First run or already stopped — ignore.
+  }
+
   const composeArgs = ["compose", "-f", composeFile, "up"];
   if (!params.usePrebuiltImage) {
     composeArgs.push("--build");
@@ -197,11 +307,38 @@ export async function runQaDockerUp(
 
   await runCommand("docker", composeArgs, repoRoot);
 
-  const qaLabUrl = `http://127.0.0.1:${qaLabPort}`;
-  const gatewayUrl = `http://127.0.0.1:${gatewayPort}/`;
+  // Brief settle delay so Docker Desktop finishes port-forwarding setup.
+  await sleepImpl(3_000);
 
-  await waitForHealth(`${qaLabUrl}/healthz`, { fetchImpl, sleepImpl });
-  await waitForHealth(`${gatewayUrl}healthz`, { fetchImpl, sleepImpl });
+  const qaLabUrl = `http://127.0.0.1:${qaLabPort}`;
+  const hostGatewayUrl = `http://127.0.0.1:${gatewayPort}/`;
+
+  await waitForHealth(`${qaLabUrl}/healthz`, {
+    label: "QA Lab",
+    fetchImpl,
+    sleepImpl,
+    composeFile,
+  });
+  await waitForDockerServiceHealth(
+    "openclaw-qa-gateway",
+    composeFile,
+    repoRoot,
+    runCommand,
+    sleepImpl,
+  );
+  let gatewayUrl = hostGatewayUrl;
+  if (!(await isHealthy(`${hostGatewayUrl}healthz`, fetchImpl))) {
+    const containerGatewayUrl = await resolveComposeServiceUrl(
+      "openclaw-qa-gateway",
+      18789,
+      composeFile,
+      repoRoot,
+      runCommand,
+    );
+    if (containerGatewayUrl && (await isHealthy(`${containerGatewayUrl}healthz`, fetchImpl))) {
+      gatewayUrl = containerGatewayUrl;
+    }
+  }
 
   return {
     outputDir,

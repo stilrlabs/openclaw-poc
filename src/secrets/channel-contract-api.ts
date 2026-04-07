@@ -1,6 +1,8 @@
+import path from "node:path";
 import type { OpenClawConfig } from "../config/config.js";
-import { loadBundledPluginPublicSurfaceModuleSync } from "../plugin-sdk/facade-runtime.js";
-import { listBundledPluginMetadata } from "../plugins/bundled-plugin-metadata.js";
+import { formatErrorMessage } from "../infra/errors.js";
+import { loadPluginManifestRegistry } from "../plugins/manifest-registry.js";
+import { loadBundledPluginPublicArtifactModuleSync } from "../plugins/public-surface-loader.js";
 import type { ResolverContext, SecretDefaults } from "./runtime-shared.js";
 import type { SecretTargetRegistryEntry } from "./target-registry-types.js";
 
@@ -22,32 +24,49 @@ type BundledChannelContractApi = {
   ) => UnsupportedSecretRefConfigCandidate[];
 };
 
+let bundledChannelDirNameByChannelId: Map<string, string> | null = null;
+
+function getBundledChannelDirName(channelId: string): string | undefined {
+  if (!bundledChannelDirNameByChannelId) {
+    bundledChannelDirNameByChannelId = new Map(
+      loadPluginManifestRegistry({})
+        .plugins.filter((entry) => entry.origin === "bundled")
+        .flatMap((entry) =>
+          entry.channels.map(
+            (candidateChannelId) => [candidateChannelId, path.basename(entry.rootDir)] as const,
+          ),
+        ),
+    );
+  }
+  return bundledChannelDirNameByChannelId.get(channelId);
+}
+
 function loadBundledChannelPublicArtifact(
   channelId: string,
   artifactBasenames: readonly string[],
 ): BundledChannelContractApi | undefined {
-  const metadata = listBundledPluginMetadata({
-    includeChannelConfigs: false,
-    includeSyntheticChannelConfigs: false,
-  }).find((entry) => entry.manifest.channels?.includes(channelId));
-  if (!metadata) {
+  const dirName = getBundledChannelDirName(channelId);
+  if (!dirName) {
     return undefined;
   }
 
   for (const artifactBasename of artifactBasenames) {
-    if (!metadata.publicSurfaceArtifacts?.includes(artifactBasename)) {
-      continue;
-    }
     try {
-      return loadBundledPluginPublicSurfaceModuleSync<BundledChannelContractApi>({
-        dirName: metadata.dirName,
+      return loadBundledPluginPublicArtifactModuleSync<BundledChannelContractApi>({
+        dirName,
         artifactBasename,
       });
     } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.startsWith("Unable to resolve bundled plugin public surface ")
+      ) {
+        continue;
+      }
       if (process.env.OPENCLAW_DEBUG_CHANNEL_CONTRACT_API === "1") {
-        const detail = error instanceof Error ? error.message : String(error);
+        const detail = formatErrorMessage(error);
         process.stderr.write(
-          `[channel-contract-api] failed to load ${channelId} via ${metadata.dirName}/${artifactBasename}: ${detail}\n`,
+          `[channel-contract-api] failed to load ${channelId} via ${dirName}/${artifactBasename}: ${detail}\n`,
         );
       }
     }
@@ -75,8 +94,5 @@ export type BundledChannelSecurityContractApi = Pick<
 export function loadBundledChannelSecurityContractApi(
   channelId: string,
 ): BundledChannelSecurityContractApi | undefined {
-  return loadBundledChannelPublicArtifact(channelId, [
-    "security-contract-api.js",
-    "contract-api.js",
-  ]);
+  return loadBundledChannelPublicArtifact(channelId, ["security-contract-api.js"]);
 }
