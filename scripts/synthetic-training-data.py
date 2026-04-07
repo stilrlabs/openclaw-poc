@@ -59,12 +59,14 @@ LOW_VALUE_RESPONSE_PATTERNS = (
     "open the file",
     "navigate to the source by opening",
 )
+# Caps apply to the pre-rebalance pool size; structural-first ordering fills
+# high-value unit types before plugin-manifest trivia competes for quota.
 RECORD_TYPE_CAP_RATIO = {
     "doc-grounded-qa": 0.12,
-    "repo-facts": 0.45,
-    "repo-navigation": 0.30,
+    "repo-facts": 0.38,
+    "repo-navigation": 0.32,
     "architecture-explanations": 0.35,
-    "dependency-reasoning": 0.25,
+    "dependency-reasoning": 0.28,
 }
 BUCKET_PRIORITY = {
     "ownership": 100,
@@ -74,6 +76,38 @@ BUCKET_PRIORITY = {
     "symbol": 60,
     "docs": 40,
 }
+# Process these unit types before plugin/workspace summary rows so topology,
+# seams, tree routing, symbols, and dependency impact win quota under caps.
+STRUCTURAL_UNIT_TYPES = frozenset(
+    {
+        "topology-owner",
+        "topology-consumer",
+        "seam-family",
+        "repo-topology",
+        "routing-root",
+        "symbol-path",
+    }
+)
+PLUGIN_UNIT_TYPE = "plugin"
+# Hard cap on rows sourced from per-plugin manifest units (not overall repo-facts).
+MAX_PLUGIN_UNIT_RECORDS_IN_CORPUS = 12
+DEFAULT_MAX_TOPOLOGY_OWNER_UNITS = 24
+DEFAULT_MAX_TOPOLOGY_CONSUMER_UNITS = 16
+DEFAULT_MAX_SEAM_FAMILIES = 16
+DEFAULT_MAX_SYMBOL_PATH_UNITS = 24
+# Phrases the helper often hallucinates; allowed only if the same idea appears in evidence excerpts.
+INFERENCE_PHRASE_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("compiled", ("compiled",)),
+    ("runtime artifact", ("runtime artifact",)),
+    ("not a source file", ("not a source file",)),
+    ("enabled by default", ("enabledbydefault",)),
+    ("disabled by default", ("enabledbydefault",)),
+)
+# Plugin id repeated as provider name (tautology), e.g. "perplexity plugin ... perplexity provider"
+PLUGIN_PROVIDER_TAUTOLOGY_RE = re.compile(
+    r"the\s+['\"]?([\w-]+)['\"]?\s+plugin\s+is\s+associated\s+with\s+the\s+['\"]?\1['\"]?\s+provider",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -152,10 +186,39 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help=f"Number of records to project into the eval sample (default: {DEFAULT_EVAL_SAMPLE_SIZE})",
     )
-    generate.add_argument("--max-plugin-units", default=24, type=int, help="Maximum plugin units.")
+    generate.add_argument(
+        "--max-plugin-units",
+        default=10,
+        type=int,
+        help="Maximum per-plugin manifest units (default: 10; lower reduces manifest trivia).",
+    )
     generate.add_argument("--max-workflow-units", default=12, type=int, help="Maximum workflow units.")
     generate.add_argument("--max-doc-units", default=24, type=int, help="Maximum docs units.")
     generate.add_argument("--max-dependency-units", default=24, type=int, help="Maximum dependency units.")
+    generate.add_argument(
+        "--max-topology-owner-units",
+        default=DEFAULT_MAX_TOPOLOGY_OWNER_UNITS,
+        type=int,
+        help=f"Maximum ts-topology-owner-map units (default: {DEFAULT_MAX_TOPOLOGY_OWNER_UNITS}).",
+    )
+    generate.add_argument(
+        "--max-topology-consumer-units",
+        default=DEFAULT_MAX_TOPOLOGY_CONSUMER_UNITS,
+        type=int,
+        help=f"Maximum consumer-topology units (default: {DEFAULT_MAX_TOPOLOGY_CONSUMER_UNITS}).",
+    )
+    generate.add_argument(
+        "--max-seam-families",
+        default=DEFAULT_MAX_SEAM_FAMILIES,
+        type=int,
+        help=f"Maximum duplicated seam family units (default: {DEFAULT_MAX_SEAM_FAMILIES}).",
+    )
+    generate.add_argument(
+        "--max-symbol-path-units",
+        default=DEFAULT_MAX_SYMBOL_PATH_UNITS,
+        type=int,
+        help=f"Maximum symbol-path units (default: {DEFAULT_MAX_SYMBOL_PATH_UNITS}).",
+    )
     generate.add_argument(
         "--dry-run",
         action="store_true",
@@ -231,6 +294,10 @@ def generate_training_data(args: argparse.Namespace) -> None:
         max_workflow_units=args.max_workflow_units,
         max_doc_units=args.max_doc_units,
         max_dependency_units=args.max_dependency_units,
+        max_topology_owner_units=args.max_topology_owner_units,
+        max_topology_consumer_units=args.max_topology_consumer_units,
+        max_seam_families=args.max_seam_families,
+        max_symbol_path_units=args.max_symbol_path_units,
     )
     records: list[dict[str, Any]] = []
     stats = {
@@ -238,10 +305,12 @@ def generate_training_data(args: argparse.Namespace) -> None:
         "units_succeeded": 0,
         "units_failed": 0,
         "records_generated": 0,
+        "records_after_validation": 0,
         "records_kept": 0,
         "duplicates_dropped": 0,
         "contradictions_dropped": 0,
         "validation_dropped": 0,
+        "rebalance_dropped": 0,
         "unit_errors": [],
     }
 
@@ -271,18 +340,25 @@ def generate_training_data(args: argparse.Namespace) -> None:
             )
             stats["units_succeeded"] += 1
             stats["records_generated"] += len(generated)
-            stats["records_kept"] += len(normalized)
+            stats["records_after_validation"] += len(normalized)
             records.extend(normalized)
         except Exception as error:  # noqa: BLE001
             stats["units_failed"] += 1
             stats["unit_errors"].append({"unit_id": unit.unit_id, "error": str(error)})
 
-    if len(records) < args.min_records:
+    pre_rebalance = len(records)
+    if pre_rebalance < args.min_records:
         raise SystemExit(
-            f"Generated only {len(records)} records, below the minimum required {args.min_records}."
+            f"Generated only {pre_rebalance} records, below the minimum required {args.min_records}."
         )
 
     records = rebalance_records(records)
+    stats["rebalance_dropped"] = pre_rebalance - len(records)
+    stats["records_kept"] = len(records)
+    if len(records) < args.min_records:
+        raise SystemExit(
+            f"After rebalance only {len(records)} records remain, below the minimum required {args.min_records}."
+        )
     records.sort(key=lambda record: (record["record_type"], record["prompt"], record["response"]))
     write_jsonl(out_dir / "synthetic-training-corpus.jsonl", records)
     write_jsonl(out_dir / "synthetic-chat-sft.jsonl", [to_chat_sft_record(record) for record in records])
@@ -443,13 +519,21 @@ def build_generation_units(
     max_workflow_units: int,
     max_doc_units: int,
     max_dependency_units: int,
+    max_topology_owner_units: int,
+    max_topology_consumer_units: int,
+    max_seam_families: int,
+    max_symbol_path_units: int,
 ) -> list[GenerationUnit]:
-    ownership_units = build_ownership_units(bundle, max_plugin_units)
+    ownership_units = build_ownership_units(bundle, max_plugin_units, max_topology_owner_units)
     routing_units = build_routing_units(bundle, max_workflow_units)
-    boundary_units = build_boundary_units(bundle)
+    boundary_units = build_boundary_units(
+        bundle,
+        max_topology_consumer_units=max_topology_consumer_units,
+        max_seam_families=max_seam_families,
+    )
     impact_units = build_impact_units(bundle, max_dependency_units)
     doc_units = build_doc_routing_units(bundle, max_doc_units)
-    symbol_units = build_curated_symbol_units(bundle, max(4, max_doc_units // 2))
+    symbol_units = build_curated_symbol_units(bundle, max_symbol_path_units)
     units = [
         *ownership_units,
         *routing_units,
@@ -493,7 +577,7 @@ def make_unit(
     )
 
 
-def build_ownership_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
+def build_ownership_units(bundle: dict[str, Any], plugin_limit: int, topology_owner_limit: int) -> list[GenerationUnit]:
     packages = bundle["workspace_packages"]["packages"]
     summary_fields = bundle["summary"]
     tree_summary = bundle.get("repo_tree_summary") or {}
@@ -562,7 +646,7 @@ def build_ownership_units(bundle: dict[str, Any], limit: int) -> list[Generation
             -len(plugin["configKeys"]),
             str(plugin["id"] or ""),
         ),
-    )[:limit]
+    )[:plugin_limit]
     for index, plugin in enumerate(selected_plugins):
         plugin_units.append(
             make_unit(
@@ -579,7 +663,7 @@ def build_ownership_units(bundle: dict[str, Any], limit: int) -> list[Generation
         )
 
     units.extend(plugin_units)
-    units.extend(build_topology_owner_units(bundle))
+    units.extend(build_topology_owner_units(bundle, topology_owner_limit))
     return units
 
 
@@ -647,11 +731,16 @@ def build_routing_units(bundle: dict[str, Any], limit: int) -> list[GenerationUn
     return units
 
 
-def build_boundary_units(bundle: dict[str, Any]) -> list[GenerationUnit]:
+def build_boundary_units(
+    bundle: dict[str, Any],
+    *,
+    max_topology_consumer_units: int,
+    max_seam_families: int,
+) -> list[GenerationUnit]:
     units: list[GenerationUnit] = []
     consumer_topology = bundle.get("ts_topology_consumer_topology")
     if isinstance(consumer_topology, dict):
-        for index, record in enumerate((consumer_topology.get("records") or [])[:10]):
+        for index, record in enumerate((consumer_topology.get("records") or [])[:max_topology_consumer_units]):
             context = {
                 "symbol": first_present(record, "canonicalKey", "publicSpecifiers", default="<unknown>"),
                 "declarationPath": record.get("declarationPath"),
@@ -682,7 +771,7 @@ def build_boundary_units(bundle: dict[str, Any]) -> list[GenerationUnit]:
     seam_inventory = bundle.get("seam_inventory")
     if isinstance(seam_inventory, dict):
         duplicated = seam_inventory.get("duplicatedSeamFamilies") or {}
-        for family_name, family in list(sorted(duplicated.items()))[:8]:
+        for family_name, family in list(sorted(duplicated.items()))[:max_seam_families]:
             context = {
                 "family": family_name,
                 "count": family.get("count"),
@@ -824,12 +913,12 @@ def build_curated_symbol_units(bundle: dict[str, Any], limit: int) -> list[Gener
     return units
 
 
-def build_topology_owner_units(bundle: dict[str, Any]) -> list[GenerationUnit]:
+def build_topology_owner_units(bundle: dict[str, Any], limit: int) -> list[GenerationUnit]:
     owner_map = bundle.get("ts_topology_owner_map")
     if not isinstance(owner_map, dict):
         return []
     units = []
-    for index, record in enumerate((owner_map.get("records") or [])[:12]):
+    for index, record in enumerate((owner_map.get("records") or [])[:limit]):
         context = {
             "symbol": first_present(record, "canonicalKey", "publicSpecifiers", default="<unknown>"),
             "declarationPath": record.get("declarationPath"),
@@ -978,6 +1067,12 @@ def helper_contract_for_unit(unit: GenerationUnit) -> dict[str, Any]:
         "plugin": {
             "task": "plugin ownership, capability location, and boundary explanations",
             "ask_for": ["repo-facts", "repo-navigation", "architecture-explanations"],
+            "avoid": [
+                "answers that are only a manifest file path",
+                "questions about default configuration keys when the answer is empty array or []",
+                "tautologies that repeat the plugin id as the provider name without new information",
+                "claims about compiled output, bundles, or runtime artifacts unless stated in evidence",
+            ],
         },
         "topology-owner": {
             "task": "who owns what and where a surface belongs",
@@ -1016,7 +1111,16 @@ def helper_contract_for_unit(unit: GenerationUnit) -> dict[str, Any]:
             "ask_for": ["repo-navigation", "repo-facts"],
         },
     }
-    return {**shared, **by_type.get(unit.unit_type, {"task": "bounded factual synthesis", "ask_for": unit.preferred_record_types})}
+    specific = by_type.get(
+        unit.unit_type,
+        {"task": "bounded factual synthesis", "ask_for": unit.preferred_record_types},
+    )
+    merged: dict[str, Any] = {**shared, **{key: value for key, value in specific.items() if key != "avoid"}}
+    extra_avoid = specific.get("avoid")
+    merged["avoid"] = list(shared["avoid"])
+    if isinstance(extra_avoid, list):
+        merged["avoid"].extend(extra_avoid)
+    return merged
 
 
 def generate_dry_run_examples(unit: GenerationUnit) -> list[dict[str, Any]]:
@@ -1029,6 +1133,51 @@ def generate_dry_run_examples(unit: GenerationUnit) -> list[dict[str, Any]]:
             "metadata": {"style": "dry-run", "unit_type": unit.unit_type},
         }
     ]
+
+
+def combined_evidence_blob(evidence: list[EvidenceEntry]) -> str:
+    return " ".join(entry.excerpt.lower() for entry in evidence)
+
+
+def response_has_unsupported_inference(response: str, evidence: list[EvidenceEntry]) -> bool:
+    blob = combined_evidence_blob(evidence)
+    lower = response.lower()
+    for phrase, required_tokens in INFERENCE_PHRASE_CHECKS:
+        if phrase not in lower:
+            continue
+        if not any(token in blob for token in required_tokens):
+            return True
+    return False
+
+
+def is_plugin_manifest_trivia(unit: GenerationUnit, prompt: str, response: str) -> bool:
+    if unit.unit_type != PLUGIN_UNIT_TYPE:
+        return False
+    prompt_lower = prompt.lower()
+    response_lower = response.lower()
+    stripped = response.strip().strip("`").strip()
+    if stripped.startswith("extensions/") and stripped.endswith(".json") and len(response) < 110:
+        return True
+    if "default configuration key" in prompt_lower or (
+        "configuration key" in prompt_lower and "default" in prompt_lower
+    ):
+        if "empty array" in response_lower or "represented as []" in response_lower or "[]" in response_lower:
+            return True
+    if PLUGIN_PROVIDER_TAUTOLOGY_RE.search(response):
+        return True
+    return False
+
+
+def unit_rebalance_tier(unit_type: str) -> int:
+    if unit_type in STRUCTURAL_UNIT_TYPES:
+        return 0
+    if unit_type == "dependency-module":
+        return 1
+    if unit_type in {"repo-summary", "workspace-overview", "workflow-routing", "doc-page"}:
+        return 2
+    if unit_type == PLUGIN_UNIT_TYPE:
+        return 4
+    return 3
 
 
 def normalize_records(
@@ -1069,6 +1218,12 @@ def normalize_records(
             stats["validation_dropped"] += 1
             continue
         if is_low_value_record(unit, prompt, response):
+            stats["validation_dropped"] += 1
+            continue
+        if is_plugin_manifest_trivia(unit, prompt, response):
+            stats["validation_dropped"] += 1
+            continue
+        if response_has_unsupported_inference(response, unit.evidence):
             stats["validation_dropped"] += 1
             continue
 
@@ -1137,28 +1292,41 @@ def is_low_value_record(unit: GenerationUnit, prompt: str, response: str) -> boo
 def rebalance_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not records:
         return records
-    prioritized = sorted(
-        records,
-        key=lambda record: (
-            -BUCKET_PRIORITY.get(record.get("metadata", {}).get("signal_bucket", ""), 0),
-            record.get("record_type", ""),
-            record.get("prompt", ""),
-        ),
-    )
-    total = len(prioritized)
+    total = len(records)
     cap_by_type = {
         record_type: max(4, math.ceil(total * ratio))
         for record_type, ratio in RECORD_TYPE_CAP_RATIO.items()
     }
+
+    def sort_key(record: dict[str, Any]) -> tuple[int, int, str, str, str]:
+        meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        unit_type = str(meta.get("unit_type") or "")
+        bucket = str(meta.get("signal_bucket") or "")
+        return (
+            unit_rebalance_tier(unit_type),
+            -BUCKET_PRIORITY.get(bucket, 0),
+            str(record.get("record_type") or ""),
+            str(record.get("prompt") or ""),
+            str(record.get("id") or ""),
+        )
+
+    prioritized = sorted(records, key=sort_key)
     kept: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
+    plugin_rows = 0
     for record in prioritized:
         record_type = record["record_type"]
         cap = cap_by_type.get(record_type, total)
         if counts.get(record_type, 0) >= cap:
             continue
+        meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        unit_type = str(meta.get("unit_type") or "")
+        if unit_type == PLUGIN_UNIT_TYPE and plugin_rows >= MAX_PLUGIN_UNIT_RECORDS_IN_CORPUS:
+            continue
         kept.append(record)
         counts[record_type] = counts.get(record_type, 0) + 1
+        if unit_type == PLUGIN_UNIT_TYPE:
+            plugin_rows += 1
     return kept
 
 
@@ -1239,7 +1407,9 @@ def write_report(
         f"- Units succeeded: `{stats['units_succeeded']}`",
         f"- Units failed: `{stats['units_failed']}`",
         f"- Records generated: `{stats['records_generated']}`",
-        f"- Records kept: `{stats['records_kept']}`",
+        f"- Records after validation (pre-rebalance): `{stats['records_after_validation']}`",
+        f"- Records kept (after rebalance): `{stats['records_kept']}`",
+        f"- Rebalance dropped: `{stats['rebalance_dropped']}`",
         f"- Duplicates dropped: `{stats['duplicates_dropped']}`",
         f"- Contradictions dropped: `{stats['contradictions_dropped']}`",
         f"- Validation dropped: `{stats['validation_dropped']}`",
