@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "description": "Static policy for scripts/synthetic-training-data.py — filters, rebalance, and signal shaping. Edit this file to hand-tune corpus mix without changing Python. Future: a helper model can consume this schema as rules. Env: SYNTHETIC_TRAINING_POLICY=path overrides default file location. CLI: --policy path.",
+  "max_excerpt_chars": 220,
+  "max_evidence_items": 2,
+  "top_level_routing_dirs": [
+    "src",
+    "extensions",
+    "packages",
+    "ui",
+    "apps",
+    "docs",
+    ".github"
+  ],
+  "symbol_summary_max_paths": 24,
+  "symbol_summary_max_symbols": 120,
+  "symbol_allowed_languages": ["JavaScript", "TypeScript"],
+  "symbol_allowed_kinds": [
+    "class",
+    "constant",
+    "enum",
+    "function",
+    "interface",
+    "method",
+    "module",
+    "type",
+    "variable"
+  ],
+  "record_type_cap_ratio": {
+    "doc-grounded-qa": 0.12,
+    "repo-facts": 0.38,
+    "repo-navigation": 0.32,
+    "architecture-explanations": 0.35,
+    "dependency-reasoning": 0.28
+  },
+  "bucket_priority": {
+    "ownership": 100,
+    "routing": 90,
+    "boundary": 85,
+    "impact": 80,
+    "symbol": 60,
+    "docs": 40
+  },
+  "structural_unit_types": [
+    "topology-owner",
+    "topology-consumer",
+    "seam-family",
+    "repo-topology",
+    "routing-root",
+    "symbol-path"
+  ],
+  "plugin_unit_type": "plugin",
+  "max_plugin_unit_records_in_corpus": 12,
+  "rebalance_default_tier": 3,
+  "rebalance_tier_by_unit_type": {
+    "dependency-module": 1,
+    "repo-summary": 2,
+    "workspace-overview": 2,
+    "workflow-routing": 2,
+    "doc-page": 2,
+    "plugin": 4
+  },
+  "low_value_doc_patterns": [
+    "code fence",
+    "code fences",
+    "heading count",
+    "supported code fence"
+  ],
+  "low_value_response_patterns": [
+    "open the file",
+    "navigate to the source by opening"
+  ],
+  "trivial_prompt_substrings": [
+    "total number of files",
+    "primary programming language"
+  ],
+  "doc_page_repository_context_tokens": ["document", "docs", "page"],
+  "inference_checks": [
+    {
+      "when_response_contains": "compiled",
+      "evidence_must_contain_any": ["compiled"]
+    },
+    {
+      "when_response_contains": "runtime artifact",
+      "evidence_must_contain_any": ["runtime artifact"]
+    },
+    {
+      "when_response_contains": "not a source file",
+      "evidence_must_contain_any": ["not a source file"]
+    },
+    {
+      "when_response_contains": "enabled by default",
+      "evidence_must_contain_any": ["enabledbydefault"]
+    },
+    {
+      "when_response_contains": "disabled by default",
+      "evidence_must_contain_any": ["enabledbydefault"]
+    }
+  ],
+  "plugin_provider_tautology_regex": "the\\s+['\\\"]?([\\w-]+)['\\\"]?\\s+plugin\\s+is\\s+associated\\s+with\\s+the\\s+['\\\"]?\\1['\\\"]?\\s+provider",
+  "plugin_provider_tautology_ignore_case": true,
+  "plugin_path_only_max_response_chars": 110
+}

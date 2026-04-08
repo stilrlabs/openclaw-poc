@@ -31,83 +31,229 @@ DEFAULT_ENDPOINT = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen3.5:2b"
 DEFAULT_MIN_RECORDS = 25
 DEFAULT_EVAL_SAMPLE_SIZE = 50
-MAX_EXCERPT_CHARS = 220
 DEFAULT_ARTIFACT_PREFIX = "code-signals-"
-MAX_EVIDENCE_ITEMS = 2
-TOP_LEVEL_ROUTING_DIRS = ["src", "extensions", "packages", "ui", "apps", "docs", ".github"]
-SYMBOL_SUMMARY_MAX_PATHS = 24
-SYMBOL_SUMMARY_MAX_SYMBOLS = 120
-SYMBOL_ALLOWED_LANGUAGES = {"JavaScript", "TypeScript"}
-SYMBOL_ALLOWED_KINDS = {
-    "class",
-    "constant",
-    "enum",
-    "function",
-    "interface",
-    "method",
-    "module",
-    "type",
-    "variable",
-}
-LOW_VALUE_DOC_PATTERNS = (
-    "code fence",
-    "code fences",
-    "heading count",
-    "supported code fence",
-)
-LOW_VALUE_RESPONSE_PATTERNS = (
-    "open the file",
-    "navigate to the source by opening",
-)
-# Caps apply to the pre-rebalance pool size; structural-first ordering fills
-# high-value unit types before plugin-manifest trivia competes for quota.
-RECORD_TYPE_CAP_RATIO = {
-    "doc-grounded-qa": 0.12,
-    "repo-facts": 0.38,
-    "repo-navigation": 0.32,
-    "architecture-explanations": 0.35,
-    "dependency-reasoning": 0.28,
-}
-BUCKET_PRIORITY = {
-    "ownership": 100,
-    "routing": 90,
-    "boundary": 85,
-    "impact": 80,
-    "symbol": 60,
-    "docs": 40,
-}
-# Process these unit types before plugin/workspace summary rows so topology,
-# seams, tree routing, symbols, and dependency impact win quota under caps.
-STRUCTURAL_UNIT_TYPES = frozenset(
-    {
-        "topology-owner",
-        "topology-consumer",
-        "seam-family",
-        "repo-topology",
-        "routing-root",
-        "symbol-path",
-    }
-)
-PLUGIN_UNIT_TYPE = "plugin"
-# Hard cap on rows sourced from per-plugin manifest units (not overall repo-facts).
-MAX_PLUGIN_UNIT_RECORDS_IN_CORPUS = 12
 DEFAULT_MAX_TOPOLOGY_OWNER_UNITS = 24
 DEFAULT_MAX_TOPOLOGY_CONSUMER_UNITS = 16
 DEFAULT_MAX_SEAM_FAMILIES = 16
 DEFAULT_MAX_SYMBOL_PATH_UNITS = 24
-# Phrases the helper often hallucinates; allowed only if the same idea appears in evidence excerpts.
-INFERENCE_PHRASE_CHECKS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("compiled", ("compiled",)),
-    ("runtime artifact", ("runtime artifact",)),
-    ("not a source file", ("not a source file",)),
-    ("enabled by default", ("enabledbydefault",)),
-    ("disabled by default", ("enabledbydefault",)),
-)
-# Plugin id repeated as provider name (tautology), e.g. "perplexity plugin ... perplexity provider"
-PLUGIN_PROVIDER_TAUTOLOGY_RE = re.compile(
-    r"the\s+['\"]?([\w-]+)['\"]?\s+plugin\s+is\s+associated\s+with\s+the\s+['\"]?\1['\"]?\s+provider",
-    re.IGNORECASE,
-)
+
+_DEFAULT_POLICY_FILE = Path(__file__).resolve().parent / "data" / "synthetic-training-policy.json"
+
+
+@dataclass(frozen=True)
+class SyntheticTrainingPolicy:
+    """Loaded from scripts/data/synthetic-training-policy.json (or --policy / env override)."""
+
+    schema_version: int
+    max_excerpt_chars: int
+    max_evidence_items: int
+    top_level_routing_dirs: tuple[str, ...]
+    symbol_summary_max_paths: int
+    symbol_summary_max_symbols: int
+    symbol_allowed_languages: frozenset[str]
+    symbol_allowed_kinds: frozenset[str]
+    record_type_cap_ratio: dict[str, float]
+    bucket_priority: dict[str, int]
+    structural_unit_types: frozenset[str]
+    plugin_unit_type: str
+    max_plugin_unit_records_in_corpus: int
+    rebalance_default_tier: int
+    rebalance_tier_by_unit_type: dict[str, int]
+    low_value_doc_patterns: tuple[str, ...]
+    low_value_response_patterns: tuple[str, ...]
+    trivial_prompt_substrings: tuple[str, ...]
+    doc_page_repository_context_tokens: tuple[str, ...]
+    inference_checks: tuple[tuple[str, tuple[str, ...]], ...]
+    plugin_provider_tautology: re.Pattern
+    plugin_path_only_max_response_chars: int
+
+
+_ACTIVE_POLICY: SyntheticTrainingPolicy | None = None
+
+
+def _parse_policy_payload(raw: dict[str, Any]) -> SyntheticTrainingPolicy:
+    version = int(raw.get("schema_version", 1))
+    if version != 1:
+        raise ValueError(f"Unsupported synthetic-training-policy schema_version: {version}")
+
+    inference_raw = raw.get("inference_checks") or []
+    inference_checks: list[tuple[str, tuple[str, ...]]] = []
+    for entry in inference_raw:
+        if not isinstance(entry, dict):
+            continue
+        phrase = str(entry.get("when_response_contains") or "").strip()
+        tokens = entry.get("evidence_must_contain_any") or []
+        if not phrase or not isinstance(tokens, list):
+            continue
+        inference_checks.append((phrase, tuple(str(t).lower() for t in tokens)))
+
+    regex_str = str(raw.get("plugin_provider_tautology_regex") or "")
+    flags = re.IGNORECASE if raw.get("plugin_provider_tautology_ignore_case", True) else 0
+    try:
+        tautology = re.compile(regex_str, flags)
+    except re.error as error:
+        raise ValueError(f"Invalid plugin_provider_tautology_regex: {error}") from error
+
+    langs = raw.get("symbol_allowed_languages") or []
+    kinds = raw.get("symbol_allowed_kinds") or []
+    structural = raw.get("structural_unit_types") or []
+
+    cap_ratio = raw.get("record_type_cap_ratio") or {}
+    bucket = raw.get("bucket_priority") or {}
+    tiers = raw.get("rebalance_tier_by_unit_type") or {}
+
+    return SyntheticTrainingPolicy(
+        schema_version=version,
+        max_excerpt_chars=int(raw["max_excerpt_chars"]),
+        max_evidence_items=int(raw["max_evidence_items"]),
+        top_level_routing_dirs=tuple(str(x) for x in (raw.get("top_level_routing_dirs") or [])),
+        symbol_summary_max_paths=int(raw["symbol_summary_max_paths"]),
+        symbol_summary_max_symbols=int(raw["symbol_summary_max_symbols"]),
+        symbol_allowed_languages=frozenset(str(x) for x in langs),
+        symbol_allowed_kinds=frozenset(str(x) for x in kinds),
+        record_type_cap_ratio={str(k): float(v) for k, v in cap_ratio.items()},
+        bucket_priority={str(k): int(v) for k, v in bucket.items()},
+        structural_unit_types=frozenset(str(x) for x in structural),
+        plugin_unit_type=str(raw.get("plugin_unit_type") or "plugin"),
+        max_plugin_unit_records_in_corpus=int(raw["max_plugin_unit_records_in_corpus"]),
+        rebalance_default_tier=int(raw.get("rebalance_default_tier", 3)),
+        rebalance_tier_by_unit_type={str(k): int(v) for k, v in tiers.items()},
+        low_value_doc_patterns=tuple(str(x) for x in (raw.get("low_value_doc_patterns") or [])),
+        low_value_response_patterns=tuple(str(x) for x in (raw.get("low_value_response_patterns") or [])),
+        trivial_prompt_substrings=tuple(str(x) for x in (raw.get("trivial_prompt_substrings") or [])),
+        doc_page_repository_context_tokens=tuple(
+            str(x) for x in (raw.get("doc_page_repository_context_tokens") or [])
+        ),
+        inference_checks=tuple(inference_checks),
+        plugin_provider_tautology=tautology,
+        plugin_path_only_max_response_chars=int(raw.get("plugin_path_only_max_response_chars", 110)),
+    )
+
+
+def _load_builtin_fallback_policy() -> SyntheticTrainingPolicy:
+    """Used only if scripts/data/synthetic-training-policy.json is missing."""
+    return _parse_policy_payload(
+        {
+            "schema_version": 1,
+            "max_excerpt_chars": 220,
+            "max_evidence_items": 2,
+            "top_level_routing_dirs": [
+                "src",
+                "extensions",
+                "packages",
+                "ui",
+                "apps",
+                "docs",
+                ".github",
+            ],
+            "symbol_summary_max_paths": 24,
+            "symbol_summary_max_symbols": 120,
+            "symbol_allowed_languages": ["JavaScript", "TypeScript"],
+            "symbol_allowed_kinds": [
+                "class",
+                "constant",
+                "enum",
+                "function",
+                "interface",
+                "method",
+                "module",
+                "type",
+                "variable",
+            ],
+            "record_type_cap_ratio": {
+                "doc-grounded-qa": 0.12,
+                "repo-facts": 0.38,
+                "repo-navigation": 0.32,
+                "architecture-explanations": 0.35,
+                "dependency-reasoning": 0.28,
+            },
+            "bucket_priority": {
+                "ownership": 100,
+                "routing": 90,
+                "boundary": 85,
+                "impact": 80,
+                "symbol": 60,
+                "docs": 40,
+            },
+            "structural_unit_types": [
+                "topology-owner",
+                "topology-consumer",
+                "seam-family",
+                "repo-topology",
+                "routing-root",
+                "symbol-path",
+            ],
+            "plugin_unit_type": "plugin",
+            "max_plugin_unit_records_in_corpus": 12,
+            "rebalance_default_tier": 3,
+            "rebalance_tier_by_unit_type": {
+                "dependency-module": 1,
+                "repo-summary": 2,
+                "workspace-overview": 2,
+                "workflow-routing": 2,
+                "doc-page": 2,
+                "plugin": 4,
+            },
+            "low_value_doc_patterns": [
+                "code fence",
+                "code fences",
+                "heading count",
+                "supported code fence",
+            ],
+            "low_value_response_patterns": [
+                "open the file",
+                "navigate to the source by opening",
+            ],
+            "trivial_prompt_substrings": [
+                "total number of files",
+                "primary programming language",
+            ],
+            "doc_page_repository_context_tokens": ["document", "docs", "page"],
+            "inference_checks": [
+                {"when_response_contains": "compiled", "evidence_must_contain_any": ["compiled"]},
+                {
+                    "when_response_contains": "runtime artifact",
+                    "evidence_must_contain_any": ["runtime artifact"],
+                },
+                {
+                    "when_response_contains": "not a source file",
+                    "evidence_must_contain_any": ["not a source file"],
+                },
+                {
+                    "when_response_contains": "enabled by default",
+                    "evidence_must_contain_any": ["enabledbydefault"],
+                },
+                {
+                    "when_response_contains": "disabled by default",
+                    "evidence_must_contain_any": ["enabledbydefault"],
+                },
+            ],
+            "plugin_provider_tautology_regex": (
+                r"the\s+['\"]?([\w-]+)['\"]?\s+plugin\s+is\s+associated\s+with\s+the\s+['\"]?\1['\"]?\s+provider"
+            ),
+            "plugin_provider_tautology_ignore_case": True,
+            "plugin_path_only_max_response_chars": 110,
+        }
+    )
+
+
+if _DEFAULT_POLICY_FILE.is_file():
+    DEFAULT_SYNTHETIC_POLICY = _parse_policy_payload(
+        json.loads(_DEFAULT_POLICY_FILE.read_text(encoding="utf-8"))
+    )
+else:
+    DEFAULT_SYNTHETIC_POLICY = _load_builtin_fallback_policy()
+
+
+def active_policy() -> SyntheticTrainingPolicy:
+    policy = _ACTIVE_POLICY
+    return policy if policy is not None else DEFAULT_SYNTHETIC_POLICY
+
+
+def load_synthetic_policy_from_path(path: Path) -> SyntheticTrainingPolicy:
+    if not path.is_file():
+        raise SystemExit(f"Synthetic training policy file not found: {path}")
+    return _parse_policy_payload(json.loads(path.read_text(encoding="utf-8")))
 
 
 @dataclass(frozen=True)
@@ -224,6 +370,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate deterministic placeholder records without calling the helper endpoint.",
     )
+    generate.add_argument(
+        "--policy",
+        default=None,
+        help=(
+            "JSON policy file (filters, rebalance, caps). "
+            "Default: scripts/data/synthetic-training-policy.json or SYNTHETIC_TRAINING_POLICY env."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -283,100 +437,114 @@ def download_artifact(*, repo: str, run_id: int, artifact_prefix: str, out_dir: 
 
 
 def generate_training_data(args: argparse.Namespace) -> None:
+    global _ACTIVE_POLICY
     input_dir = Path(args.input_dir).resolve()
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bundle = load_bundle(input_dir)
-    units = build_generation_units(
-        bundle,
-        max_plugin_units=args.max_plugin_units,
-        max_workflow_units=args.max_workflow_units,
-        max_doc_units=args.max_doc_units,
-        max_dependency_units=args.max_dependency_units,
-        max_topology_owner_units=args.max_topology_owner_units,
-        max_topology_consumer_units=args.max_topology_consumer_units,
-        max_seam_families=args.max_seam_families,
-        max_symbol_path_units=args.max_symbol_path_units,
-    )
-    records: list[dict[str, Any]] = []
-    stats = {
-        "units_total": len(units),
-        "units_succeeded": 0,
-        "units_failed": 0,
-        "records_generated": 0,
-        "records_after_validation": 0,
-        "records_kept": 0,
-        "duplicates_dropped": 0,
-        "contradictions_dropped": 0,
-        "validation_dropped": 0,
-        "rebalance_dropped": 0,
-        "unit_errors": [],
-    }
+    previous_policy = _ACTIVE_POLICY
+    try:
+        if args.policy:
+            _ACTIVE_POLICY = load_synthetic_policy_from_path(Path(args.policy).resolve())
+        elif os.environ.get("SYNTHETIC_TRAINING_POLICY"):
+            _ACTIVE_POLICY = load_synthetic_policy_from_path(
+                Path(os.environ["SYNTHETIC_TRAINING_POLICY"]).expanduser().resolve()
+            )
+        else:
+            _ACTIVE_POLICY = None
 
-    seen_prompt_to_response: dict[str, str] = {}
-    seen_record_hashes: set[str] = set()
+        bundle = load_bundle(input_dir)
+        units = build_generation_units(
+            bundle,
+            max_plugin_units=args.max_plugin_units,
+            max_workflow_units=args.max_workflow_units,
+            max_doc_units=args.max_doc_units,
+            max_dependency_units=args.max_dependency_units,
+            max_topology_owner_units=args.max_topology_owner_units,
+            max_topology_consumer_units=args.max_topology_consumer_units,
+            max_seam_families=args.max_seam_families,
+            max_symbol_path_units=args.max_symbol_path_units,
+        )
+        records: list[dict[str, Any]] = []
+        stats = {
+            "units_total": len(units),
+            "units_succeeded": 0,
+            "units_failed": 0,
+            "records_generated": 0,
+            "records_after_validation": 0,
+            "records_kept": 0,
+            "duplicates_dropped": 0,
+            "contradictions_dropped": 0,
+            "validation_dropped": 0,
+            "rebalance_dropped": 0,
+            "unit_errors": [],
+        }
 
-    for unit in units:
-        try:
-            generated = (
-                generate_dry_run_examples(unit)
-                if args.dry_run
-                else call_helper_endpoint(
-                    unit=unit,
-                    helper_endpoint=args.helper_endpoint,
-                    helper_model=args.helper_model,
-                    helper_timeout_seconds=args.helper_timeout_seconds,
-                    helper_temperature=args.helper_temperature,
+        seen_prompt_to_response: dict[str, str] = {}
+        seen_record_hashes: set[str] = set()
+
+        for unit in units:
+            try:
+                generated = (
+                    generate_dry_run_examples(unit)
+                    if args.dry_run
+                    else call_helper_endpoint(
+                        unit=unit,
+                        helper_endpoint=args.helper_endpoint,
+                        helper_model=args.helper_model,
+                        helper_timeout_seconds=args.helper_timeout_seconds,
+                        helper_temperature=args.helper_temperature,
+                    )
                 )
-            )
-            normalized = normalize_records(
-                generated,
-                unit=unit,
-                bundle=bundle,
-                seen_prompt_to_response=seen_prompt_to_response,
-                seen_record_hashes=seen_record_hashes,
-                stats=stats,
-            )
-            stats["units_succeeded"] += 1
-            stats["records_generated"] += len(generated)
-            stats["records_after_validation"] += len(normalized)
-            records.extend(normalized)
-        except Exception as error:  # noqa: BLE001
-            stats["units_failed"] += 1
-            stats["unit_errors"].append({"unit_id": unit.unit_id, "error": str(error)})
+                normalized = normalize_records(
+                    generated,
+                    unit=unit,
+                    bundle=bundle,
+                    seen_prompt_to_response=seen_prompt_to_response,
+                    seen_record_hashes=seen_record_hashes,
+                    stats=stats,
+                )
+                stats["units_succeeded"] += 1
+                stats["records_generated"] += len(generated)
+                stats["records_after_validation"] += len(normalized)
+                records.extend(normalized)
+            except Exception as error:  # noqa: BLE001
+                stats["units_failed"] += 1
+                stats["unit_errors"].append({"unit_id": unit.unit_id, "error": str(error)})
 
-    pre_rebalance = len(records)
-    if pre_rebalance < args.min_records:
-        raise SystemExit(
-            f"Generated only {pre_rebalance} records, below the minimum required {args.min_records}."
-        )
+        pre_rebalance = len(records)
+        if pre_rebalance < args.min_records:
+            raise SystemExit(
+                f"Generated only {pre_rebalance} records, below the minimum required {args.min_records}."
+            )
 
-    records = rebalance_records(records)
-    stats["rebalance_dropped"] = pre_rebalance - len(records)
-    stats["records_kept"] = len(records)
-    if len(records) < args.min_records:
-        raise SystemExit(
-            f"After rebalance only {len(records)} records remain, below the minimum required {args.min_records}."
+        records = rebalance_records(records)
+        stats["rebalance_dropped"] = pre_rebalance - len(records)
+        stats["records_kept"] = len(records)
+        if len(records) < args.min_records:
+            raise SystemExit(
+                f"After rebalance only {len(records)} records remain, below the minimum required {args.min_records}."
+            )
+        records.sort(key=lambda record: (record["record_type"], record["prompt"], record["response"]))
+        write_jsonl(out_dir / "synthetic-training-corpus.jsonl", records)
+        write_jsonl(out_dir / "synthetic-chat-sft.jsonl", [to_chat_sft_record(record) for record in records])
+        write_jsonl(out_dir / "synthetic-instruction.jsonl", [to_instruction_record(record) for record in records])
+        write_jsonl(
+            out_dir / "synthetic-eval-sample.jsonl",
+            project_eval_sample(records, args.eval_sample_size),
         )
-    records.sort(key=lambda record: (record["record_type"], record["prompt"], record["response"]))
-    write_jsonl(out_dir / "synthetic-training-corpus.jsonl", records)
-    write_jsonl(out_dir / "synthetic-chat-sft.jsonl", [to_chat_sft_record(record) for record in records])
-    write_jsonl(out_dir / "synthetic-instruction.jsonl", [to_instruction_record(record) for record in records])
-    write_jsonl(
-        out_dir / "synthetic-eval-sample.jsonl",
-        project_eval_sample(records, args.eval_sample_size),
-    )
-    write_report(
-        out_dir / "synthetic-generation-report.md",
-        bundle=bundle,
-        records=records,
-        units=units,
-        helper_endpoint=args.helper_endpoint,
-        helper_model=args.helper_model,
-        dry_run=args.dry_run,
-        stats=stats,
-    )
+        write_report(
+            out_dir / "synthetic-generation-report.md",
+            bundle=bundle,
+            records=records,
+            units=units,
+            helper_endpoint=args.helper_endpoint,
+            helper_model=args.helper_model,
+            dry_run=args.dry_run,
+            stats=stats,
+        )
+    finally:
+        _ACTIVE_POLICY = previous_policy
 
 
 def load_bundle(input_dir: Path) -> dict[str, Any]:
@@ -435,7 +603,7 @@ def parse_repo_tree_summary(repo_tree_markdown: str | None) -> dict[str, Any] | 
             top_level_entries.append(stripped)
             key_root_children.setdefault(stripped, [])
             continue
-        if indent == 4 and current_root in TOP_LEVEL_ROUTING_DIRS:
+        if indent == 4 and current_root in active_policy().top_level_routing_dirs:
             children = key_root_children.setdefault(current_root, [])
             if len(children) < 8:
                 children.append(stripped)
@@ -454,6 +622,7 @@ def load_symbol_summary(input_dir: Path) -> dict[str, Any] | None:
         return None
     tags_payload = read_json(tags_path)
     tags = tags_payload.get("tags", [])
+    policy = active_policy()
     filtered = []
     for tag in tags:
         if not isinstance(tag, dict):
@@ -461,9 +630,9 @@ def load_symbol_summary(input_dir: Path) -> dict[str, Any] | None:
         language = tag.get("language")
         kind = tag.get("kind")
         path = tag.get("path")
-        if language not in SYMBOL_ALLOWED_LANGUAGES:
+        if language not in policy.symbol_allowed_languages:
             continue
-        if kind not in SYMBOL_ALLOWED_KINDS:
+        if kind not in policy.symbol_allowed_kinds:
             continue
         if not isinstance(path, str) or not path.startswith(("src/", "extensions/", "packages/", "ui/")):
             continue
@@ -503,8 +672,8 @@ def load_symbol_summary(input_dir: Path) -> dict[str, Any] | None:
             for path, path_tags in by_path.items()
         ),
         key=lambda item: (-item["symbolCount"], item["path"]),
-    )[:SYMBOL_SUMMARY_MAX_PATHS]
-    top_symbols = filtered[:SYMBOL_SUMMARY_MAX_SYMBOLS]
+    )[: policy.symbol_summary_max_paths]
+    top_symbols = filtered[: policy.symbol_summary_max_symbols]
     return {
         "source": "derived-from-tags",
         "importantPaths": top_paths,
@@ -545,7 +714,7 @@ def build_generation_units(
     return sorted(
         units,
         key=lambda unit: (
-            -BUCKET_PRIORITY.get(unit.signal_bucket, 0),
+            -active_policy().bucket_priority.get(unit.signal_bucket, 0),
             unit.unit_type,
             unit.unit_id,
         ),
@@ -571,7 +740,7 @@ def make_unit(
         title=title,
         prompt_context=prompt_context,
         source_artifacts=source_artifacts,
-        evidence=evidence[:MAX_EVIDENCE_ITEMS],
+        evidence=evidence[: active_policy().max_evidence_items],
         preferred_record_types=preferred_record_types,
         example_budget=example_budget,
     )
@@ -684,7 +853,7 @@ def build_routing_units(bundle: dict[str, Any], limit: int) -> list[GenerationUn
                 example_budget=3,
             )
         )
-        for root_name in TOP_LEVEL_ROUTING_DIRS:
+        for root_name in active_policy().top_level_routing_dirs:
             children = tree_summary.get("keyRoots", {}).get(root_name, [])
             if not children:
                 continue
@@ -1142,7 +1311,7 @@ def combined_evidence_blob(evidence: list[EvidenceEntry]) -> str:
 def response_has_unsupported_inference(response: str, evidence: list[EvidenceEntry]) -> bool:
     blob = combined_evidence_blob(evidence)
     lower = response.lower()
-    for phrase, required_tokens in INFERENCE_PHRASE_CHECKS:
+    for phrase, required_tokens in active_policy().inference_checks:
         if phrase not in lower:
             continue
         if not any(token in blob for token in required_tokens):
@@ -1151,33 +1320,30 @@ def response_has_unsupported_inference(response: str, evidence: list[EvidenceEnt
 
 
 def is_plugin_manifest_trivia(unit: GenerationUnit, prompt: str, response: str) -> bool:
-    if unit.unit_type != PLUGIN_UNIT_TYPE:
+    policy = active_policy()
+    if unit.unit_type != policy.plugin_unit_type:
         return False
     prompt_lower = prompt.lower()
     response_lower = response.lower()
     stripped = response.strip().strip("`").strip()
-    if stripped.startswith("extensions/") and stripped.endswith(".json") and len(response) < 110:
+    max_path = policy.plugin_path_only_max_response_chars
+    if stripped.startswith("extensions/") and stripped.endswith(".json") and len(response) < max_path:
         return True
     if "default configuration key" in prompt_lower or (
         "configuration key" in prompt_lower and "default" in prompt_lower
     ):
         if "empty array" in response_lower or "represented as []" in response_lower or "[]" in response_lower:
             return True
-    if PLUGIN_PROVIDER_TAUTOLOGY_RE.search(response):
+    if policy.plugin_provider_tautology.search(response):
         return True
     return False
 
 
 def unit_rebalance_tier(unit_type: str) -> int:
-    if unit_type in STRUCTURAL_UNIT_TYPES:
+    policy = active_policy()
+    if unit_type in policy.structural_unit_types:
         return 0
-    if unit_type == "dependency-module":
-        return 1
-    if unit_type in {"repo-summary", "workspace-overview", "workflow-routing", "doc-page"}:
-        return 2
-    if unit_type == PLUGIN_UNIT_TYPE:
-        return 4
-    return 3
+    return policy.rebalance_tier_by_unit_type.get(unit_type, policy.rebalance_default_tier)
 
 
 def normalize_records(
@@ -1269,22 +1435,27 @@ def normalize_records(
 
 
 def is_low_value_record(unit: GenerationUnit, prompt: str, response: str) -> bool:
+    policy = active_policy()
     prompt_lower = prompt.lower()
     response_lower = response.lower()
     if unit.unit_type == "doc-page":
-        if any(pattern in prompt_lower for pattern in LOW_VALUE_DOC_PATTERNS):
+        if any(pattern in prompt_lower for pattern in policy.low_value_doc_patterns):
             return True
-        if any(pattern in response_lower for pattern in LOW_VALUE_DOC_PATTERNS):
+        if any(pattern in response_lower for pattern in policy.low_value_doc_patterns):
             return True
-        if "repository" in prompt_lower and not any(token in prompt_lower for token in ("document", "docs", "page")):
+        if "repository" in prompt_lower and not any(
+            token in prompt_lower for token in policy.doc_page_repository_context_tokens
+        ):
             return True
     if unit.unit_type in {"dependency-module", "symbol-path"}:
         source_path = str(unit.prompt_context.get("source") or unit.prompt_context.get("path") or "").lower()
-        if source_path and source_path in prompt_lower and any(pattern in response_lower for pattern in LOW_VALUE_RESPONSE_PATTERNS):
+        if source_path and source_path in prompt_lower and any(
+            pattern in response_lower for pattern in policy.low_value_response_patterns
+        ):
             return True
-    if "total number of files" in prompt_lower or "primary programming language" in prompt_lower:
+    if any(sub in prompt_lower for sub in policy.trivial_prompt_substrings):
         return True
-    if any(pattern in response_lower for pattern in LOW_VALUE_RESPONSE_PATTERNS):
+    if any(pattern in response_lower for pattern in policy.low_value_response_patterns):
         return True
     return False
 
@@ -1292,10 +1463,11 @@ def is_low_value_record(unit: GenerationUnit, prompt: str, response: str) -> boo
 def rebalance_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not records:
         return records
+    policy = active_policy()
     total = len(records)
     cap_by_type = {
         record_type: max(4, math.ceil(total * ratio))
-        for record_type, ratio in RECORD_TYPE_CAP_RATIO.items()
+        for record_type, ratio in policy.record_type_cap_ratio.items()
     }
 
     def sort_key(record: dict[str, Any]) -> tuple[int, int, str, str, str]:
@@ -1304,7 +1476,7 @@ def rebalance_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         bucket = str(meta.get("signal_bucket") or "")
         return (
             unit_rebalance_tier(unit_type),
-            -BUCKET_PRIORITY.get(bucket, 0),
+            -policy.bucket_priority.get(bucket, 0),
             str(record.get("record_type") or ""),
             str(record.get("prompt") or ""),
             str(record.get("id") or ""),
@@ -1321,11 +1493,14 @@ def rebalance_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         unit_type = str(meta.get("unit_type") or "")
-        if unit_type == PLUGIN_UNIT_TYPE and plugin_rows >= MAX_PLUGIN_UNIT_RECORDS_IN_CORPUS:
+        if (
+            unit_type == policy.plugin_unit_type
+            and plugin_rows >= policy.max_plugin_unit_records_in_corpus
+        ):
             continue
         kept.append(record)
         counts[record_type] = counts.get(record_type, 0) + 1
-        if unit_type == PLUGIN_UNIT_TYPE:
+        if unit_type == policy.plugin_unit_type:
             plugin_rows += 1
     return kept
 
@@ -1431,8 +1606,9 @@ def write_report(
 
 def evidence_from_object(artifact: str, locator: str, payload: Any) -> EvidenceEntry:
     rendered = json.dumps(payload, sort_keys=True, ensure_ascii=True)
-    excerpt = rendered[:MAX_EXCERPT_CHARS]
-    if len(rendered) > MAX_EXCERPT_CHARS:
+    limit = active_policy().max_excerpt_chars
+    excerpt = rendered[:limit]
+    if len(rendered) > limit:
         excerpt += "..."
     return EvidenceEntry(artifact=artifact, locator=locator, excerpt=excerpt)
 
