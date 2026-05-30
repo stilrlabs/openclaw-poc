@@ -18,17 +18,31 @@ echo ""
 echo "--- GitHub Actions runner (label: trainer) ---"
 if pgrep -f 'Runner.Listener' >/dev/null 2>&1; then
   pass "actions-runner process is running"
+  RUNNER_PID="$(pgrep -f 'Runner.Listener run' | head -1 || true)"
+  DOCKER_GID="$(getent group docker | cut -d: -f3 || true)"
+  if [[ -n "${RUNNER_PID}" && -n "${DOCKER_GID}" ]]; then
+    # Groups line is tab-separated: "Groups:\t935 951 ..." — must not use $2 only.
+    RUNNER_GROUPS="$(awk '/^Groups:/ { $1=""; sub(/^[[:space:]]+/, ""); print }' "/proc/${RUNNER_PID}/status")"
+    if [[ " ${RUNNER_GROUPS} " == *" ${DOCKER_GID} "* ]]; then
+      pass "Runner.Listener has docker group in process credentials (gid ${DOCKER_GID}; groups: ${RUNNER_GROUPS})"
+    else
+      fail "Runner.Listener missing docker group at runtime (groups: ${RUNNER_GROUPS})"
+      echo "       usermod -aG docker github-actions is not enough until the runner restarts."
+      echo "       sudo systemctl restart github-actions"
+      echo "       install scripts/trainer/github-actions.service.d-rocm-docker.conf if Docker API still fails"
+    fi
+  fi
 else
   fail "no Runner.Listener process — install/start a self-hosted runner with label trainer"
   echo "       https://docs.github.com/en/actions/hosting-your-own-runners"
 fi
 if command -v systemctl >/dev/null 2>&1; then
-  if systemctl --user list-unit-files 'actions.runner*' 2>/dev/null | rg -q 'actions\.runner'; then
-    pass "runner systemd user unit file present"
+  if systemctl is-active github-actions >/dev/null 2>&1; then
+    pass "github-actions.service is active"
   elif systemctl list-unit-files 'actions.runner*' 2>/dev/null | rg -q 'actions\.runner'; then
-    pass "runner systemd system unit file present"
+    pass "actions.runner systemd unit present"
   else
-    warn "no actions.runner systemd unit found (runner may be started manually)"
+    warn "no github-actions.service or actions.runner unit detected"
   fi
 fi
 
@@ -65,8 +79,13 @@ fi
 if docker info >/dev/null 2>&1; then
   pass "docker daemon reachable from this shell"
 else
-  warn "docker.sock denied for this user — OK if the runner service user is in group docker"
-  warn "CI uses job container:; the runner process must still access Docker"
+  warn "docker.sock denied for this user — OK if only the runner service uses Docker"
+fi
+if [[ -f /usr/lib/systemd/system/github-actions.service ]] \
+  && rg -q 'ProtectSystem=strict' /usr/lib/systemd/system/github-actions.service 2>/dev/null \
+  && [[ ! -f /etc/systemd/system/github-actions.service.d/rocm-docker.conf ]]; then
+  fail "github-actions.service uses ProtectSystem=strict without docker.sock in ReadWritePaths"
+  echo "       install scripts/trainer/github-actions.service.d-rocm-docker.conf (see file header)"
 fi
 if id -nG | rg -qw 'video|render'; then
   pass "user in video/render group (GPU device access)"
