@@ -1,0 +1,9 @@
+# Pinned ML stack for ROCm LoRA SFT (Qwen3.5; transformers 5.9+).
+transformers==5.9.0
+peft==0.19.1
+datasets==4.8.5
+accelerate==1.13.0
+safetensors==0.7.0
+sentencepiece==0.2.1
+tiktoken==0.13.0
+huggingface_hub==1.17.0

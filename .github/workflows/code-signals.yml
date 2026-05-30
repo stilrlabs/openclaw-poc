@@ -25,6 +25,21 @@ on:
         options:
           - windows
           - macos
+      train_max_steps:
+        description: "LoRA SFT step budget for train-synthetic-lora (smoke default 20)"
+        required: false
+        default: "20"
+        type: string
+      train_model_id:
+        description: "Hugging Face model id for LoRA training"
+        required: false
+        default: "Qwen/Qwen3.5-0.8B"
+        type: string
+      run_lora_training:
+        description: "Run LoRA training on the trainer runner (workflow_dispatch only; not run on push/PR)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -155,5 +170,94 @@ jobs:
         with:
           name: synthetic-training-data-${{ github.sha }}
           path: .artifacts/synthetic-training-data/${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+
+  train-synthetic-lora:
+    needs: [synthetic-training-data]
+    # Manual only: enable "Run LoRA training" when starting workflow_dispatch in the Actions UI.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_lora_training
+    # Self-hosted AMD GPU host; runner label must be `trainer` (Settings → Actions → Runners).
+    runs-on: trainer
+    timeout-minutes: 120
+    env:
+      TRAIN_MAX_STEPS: ${{ github.event.inputs.train_max_steps || '20' }}
+      TRAIN_MODEL_ID: ${{ github.event.inputs.train_model_id || 'Qwen/Qwen3.5-0.8B' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+
+      - name: Download synthetic training-data artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: synthetic-training-data-${{ github.sha }}
+          path: .artifacts/synthetic-training-input
+
+      - name: ROCm GPU preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v rocminfo >/dev/null 2>&1; then
+            rocminfo | head -n 40
+          else
+            echo "rocminfo not on PATH; continuing (Docker may still see /dev/kfd and /dev/dri)"
+          fi
+          docker run --rm \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add=video \
+            --ipc=host \
+            rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0 \
+            python3 -c "import torch; assert torch.cuda.is_available(), 'ROCm GPU not visible to PyTorch'"
+
+      - name: Build ROCm SFT image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build -t openclaw-code-signals-sft:local scripts/docker/code-signals-sft
+
+      - name: Train LoRA adapter (ROCm Docker)
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p ".artifacts/synthetic-lora/${{ github.sha }}" .cache/huggingface
+          DATA_PATH=".artifacts/synthetic-training-input/synthetic-chat-sft.jsonl"
+          EVAL_PATH=".artifacts/synthetic-training-input/synthetic-eval-sample.jsonl"
+          if [[ ! -f "$DATA_PATH" ]]; then
+            echo "::error::Missing $DATA_PATH in synthetic-training-data artifact"
+            exit 1
+          fi
+          EVAL_ARGS=()
+          if [[ -f "$EVAL_PATH" ]]; then
+            EVAL_ARGS+=(--eval-data "/work/${EVAL_PATH}")
+          fi
+          docker run --rm \
+            --device=/dev/kfd --device=/dev/dri \
+            --group-add=video \
+            --ipc=host \
+            --shm-size=16g \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -e HF_TOKEN \
+            -e HUGGINGFACE_HUB_TOKEN="${HF_TOKEN:-}" \
+            -e HUGGINGFACE_HUB_CACHE=/work/.cache/huggingface \
+            openclaw-code-signals-sft:local \
+            /work/scripts/code-signals-train-lora.py \
+              --data "/work/${DATA_PATH}" \
+              "${EVAL_ARGS[@]}" \
+              --output-dir "/work/.artifacts/synthetic-lora/${{ github.sha }}" \
+              --model-id "${TRAIN_MODEL_ID}" \
+              --max-steps "${TRAIN_MAX_STEPS}"
+
+      - name: Upload LoRA adapter artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: synthetic-lora-${{ github.sha }}
+          path: .artifacts/synthetic-lora/${{ github.sha }}
           if-no-files-found: error
           retention-days: 7
