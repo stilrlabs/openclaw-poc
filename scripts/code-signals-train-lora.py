@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any
 
 MIN_TRANSFORMERS_VERSION = (5, 9, 0)
 DEFAULT_MODEL_ID = "Qwen/Qwen3.5-0.8B"
+DEFAULT_ROCM_DEVICE_ID = "0"
 DEFAULT_SYSTEM_PROMPT = (
     "You answer questions about this repository using grounded facts from "
     "extracted code and documentation artifacts."
@@ -123,6 +125,29 @@ def discover_lora_target_modules(model: Any) -> list[str]:
     return sorted(set(names))
 
 
+def prompt_token_prefix_length(prompt_ids: list[int], full_ids: list[int]) -> int:
+    """Length of the longest shared prefix (prompt masking must align with full_ids)."""
+    prefix_len = 0
+    for prompt_id, full_id in zip(prompt_ids, full_ids, strict=False):
+        if prompt_id != full_id:
+            break
+        prefix_len += 1
+    if prefix_len == 0:
+        raise ValueError("prompt tokens are not a prefix of the full chat tokenization")
+    return prefix_len
+
+
+def configure_rocm_visible_devices(device_id: str) -> str:
+    """Hide iGPU/extra adapters; must run before importing torch."""
+    device_id = device_id.strip()
+    if not device_id:
+        raise ValueError("rocm device id must not be empty")
+    os.environ["CUDA_VISIBLE_DEVICES"] = device_id
+    os.environ["HIP_VISIBLE_DEVICES"] = device_id
+    os.environ["ROCR_VISIBLE_DEVICES"] = device_id
+    return device_id
+
+
 def tokenize_sft_example(
     tokenizer: Any,
     messages: list[dict[str, str]],
@@ -151,9 +176,8 @@ def tokenize_sft_example(
 
     if len(full_ids) > max_seq_len:
         full_ids = full_ids[:max_seq_len]
-        prompt_len = min(len(prompt_ids), max_seq_len)
-    else:
-        prompt_len = len(prompt_ids)
+
+    prompt_len = min(prompt_token_prefix_length(prompt_ids, full_ids), len(full_ids))
 
     labels = [-100] * len(full_ids)
     for index in range(prompt_len, len(full_ids)):
@@ -207,6 +231,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--learning-rate", type=float, default=2e-4, help="AdamW learning rate")
     parser.add_argument(
+        "--rocm-device-id",
+        default=os.environ.get("ROCM_DEVICE_ID", DEFAULT_ROCM_DEVICE_ID),
+        help="HIP/CUDA visible device index (default 0 = first GPU, usually discrete RX)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Load two records and run one forward pass (no adapter save).",
@@ -216,12 +245,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def run_training(args: argparse.Namespace) -> dict[str, Any]:
     require_transformers_version()
+    visible_device = configure_rocm_visible_devices(args.rocm_device_id)
 
     import torch
     from peft import LoraConfig, get_peft_model
     from transformers import (
         AutoModelForImageTextToText,
         AutoProcessor,
+        DataCollatorForSeq2Seq,
         Trainer,
         TrainingArguments,
     )
@@ -244,8 +275,10 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if rocm_available() else torch.float32,
     )
+    device = torch.device("cpu")
     if rocm_available():
-        model = model.to("cuda")
+        device = torch.device("cuda:0")
+        model = model.to(device)
 
     target_modules = discover_lora_target_modules(model)
     lora_config = LoraConfig(
@@ -266,10 +299,16 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             eval_records = eval_records[:2]
         eval_dataset = build_dataset_dict(eval_records, tokenizer, max_seq_len=args.max_seq_len)
 
+    gpu_name = None
+    if rocm_available():
+        gpu_name = torch.cuda.get_device_name(0)
+
     metrics: dict[str, Any] = {
         "model_id": args.model_id,
         "record_count": len(train_records),
         "rocm_available": rocm_available(),
+        "rocm_visible_devices": visible_device,
+        "rocm_device_name": gpu_name,
         "dry_run": args.dry_run,
         "max_steps": args.max_steps,
         "lora_target_modules": target_modules,
@@ -301,6 +340,18 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         report_to=[],
         remove_unused_columns=False,
         dataloader_pin_memory=rocm_available(),
+        # Single visible device; avoid DataParallel across iGPU + discrete GPU.
+        ddp_find_unused_parameters=False,
+    )
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        padding=True,
+        label_pad_token_id=-100,
+        pad_to_multiple_of=8,
     )
 
     trainer = Trainer(
@@ -308,6 +359,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        data_collator=data_collator,
     )
     train_result = trainer.train()
     metrics["train_loss"] = float(train_result.training_loss) if train_result.training_loss is not None else None

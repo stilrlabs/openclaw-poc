@@ -193,6 +193,11 @@ jobs:
       TRAIN_MAX_STEPS: ${{ github.event.inputs.train_max_steps || '20' }}
       TRAIN_MODEL_ID: ${{ github.event.inputs.train_model_id || 'Qwen/Qwen3.5-0.8B' }}
       HUGGINGFACE_HUB_CACHE: ${{ github.workspace }}/.cache/huggingface
+      # gfx1100 discrete GPU is usually index 0; hide Ryzen iGPU (second adapter).
+      CUDA_VISIBLE_DEVICES: "0"
+      HIP_VISIBLE_DEVICES: "0"
+      ROCR_VISIBLE_DEVICES: "0"
+      ROCM_DEVICE_ID: "0"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -212,7 +217,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c "import torch; assert torch.cuda.is_available(), 'ROCm GPU not visible to PyTorch'; print(torch.cuda.get_device_name(0))"
+          python3 -c "import os; os.environ['CUDA_VISIBLE_DEVICES']='0'; os.environ['HIP_VISIBLE_DEVICES']='0'; import torch; assert torch.cuda.is_available(); print('device_count', torch.cuda.device_count()); print('device0', torch.cuda.get_device_name(0))"
 
       - name: Install SFT Python dependencies
         shell: bash

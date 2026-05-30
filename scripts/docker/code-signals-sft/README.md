@@ -43,4 +43,6 @@ docker run --rm \
 
 The `train-synthetic-lora` job runs only on **workflow_dispatch** when you enable **Run LoRA training**. It runs inside the image set by **train_container_image** (default `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0`), installs `requirements-sft.txt` in-container, then runs `scripts/code-signals-train-lora.py`. Override the image in the Actions UI without building a custom image locally.
 
+Training pins **`CUDA_VISIBLE_DEVICES=0`** / **`HIP_VISIBLE_DEVICES=0`** so PyTorch uses the discrete GPU (RX 7900 XTX), not the Ryzen iGPU. If your discrete card is another index, set `ROCM_DEVICE_ID` or pass `--rocm-device-id`.
+
 `Dockerfile` in this directory is optional (local pre-baked image); CI does not `docker build` or `docker run`.
