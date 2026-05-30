@@ -40,6 +40,11 @@ on:
         required: false
         default: false
         type: boolean
+      train_container_image:
+        description: "ROCm PyTorch container image (runner pulls/runs it; no docker CLI in steps)"
+        required: false
+        default: "rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0"
+        type: string
 
 permissions:
   contents: read
@@ -179,10 +184,15 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.run_lora_training
     # Self-hosted AMD GPU host; runner label must be `trainer` (Settings → Actions → Runners).
     runs-on: trainer
+    # Job container: runner orchestrates Docker (no `docker` CLI in workflow steps).
+    container:
+      image: ${{ github.event.inputs.train_container_image || 'rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0' }}
+      options: --device=/dev/kfd --device=/dev/dri --group-add=video --ipc=host --shm-size=16g
     timeout-minutes: 120
     env:
       TRAIN_MAX_STEPS: ${{ github.event.inputs.train_max_steps || '20' }}
       TRAIN_MODEL_ID: ${{ github.event.inputs.train_model_id || 'Qwen/Qwen3.5-0.8B' }}
+      HUGGINGFACE_HUB_CACHE: ${{ github.workspace }}/.cache/huggingface
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -202,28 +212,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if command -v rocminfo >/dev/null 2>&1; then
-            rocminfo | head -n 40
-          else
-            echo "rocminfo not on PATH; continuing (Docker may still see /dev/kfd and /dev/dri)"
-          fi
-          docker run --rm \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add=video \
-            --ipc=host \
-            rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0 \
-            python3 -c "import torch; assert torch.cuda.is_available(), 'ROCm GPU not visible to PyTorch'"
+          python3 -c "import torch; assert torch.cuda.is_available(), 'ROCm GPU not visible to PyTorch'; print(torch.cuda.get_device_name(0))"
 
-      - name: Build ROCm SFT image
+      - name: Install SFT Python dependencies
         shell: bash
         run: |
           set -euo pipefail
-          docker build -t openclaw-code-signals-sft:local scripts/docker/code-signals-sft
+          python3 -m pip install --no-cache-dir -r scripts/docker/code-signals-sft/requirements-sft.txt
 
-      - name: Train LoRA adapter (ROCm Docker)
+      - name: Train LoRA adapter
         shell: bash
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -euo pipefail
           mkdir -p ".artifacts/synthetic-lora/${{ github.sha }}" .cache/huggingface
@@ -235,24 +236,14 @@ jobs:
           fi
           EVAL_ARGS=()
           if [[ -f "$EVAL_PATH" ]]; then
-            EVAL_ARGS+=(--eval-data "/work/${EVAL_PATH}")
+            EVAL_ARGS+=(--eval-data "${EVAL_PATH}")
           fi
-          docker run --rm \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add=video \
-            --ipc=host \
-            --shm-size=16g \
-            -v "$GITHUB_WORKSPACE:/work" \
-            -e HF_TOKEN \
-            -e HUGGINGFACE_HUB_TOKEN="${HF_TOKEN:-}" \
-            -e HUGGINGFACE_HUB_CACHE=/work/.cache/huggingface \
-            openclaw-code-signals-sft:local \
-            /work/scripts/code-signals-train-lora.py \
-              --data "/work/${DATA_PATH}" \
-              "${EVAL_ARGS[@]}" \
-              --output-dir "/work/.artifacts/synthetic-lora/${{ github.sha }}" \
-              --model-id "${TRAIN_MODEL_ID}" \
-              --max-steps "${TRAIN_MAX_STEPS}"
+          python3 scripts/code-signals-train-lora.py \
+            --data "${DATA_PATH}" \
+            "${EVAL_ARGS[@]}" \
+            --output-dir ".artifacts/synthetic-lora/${{ github.sha }}" \
+            --model-id "${TRAIN_MODEL_ID}" \
+            --max-steps "${TRAIN_MAX_STEPS}"
 
       - name: Upload LoRA adapter artifact
         uses: actions/upload-artifact@v7

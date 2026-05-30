@@ -14,7 +14,7 @@ Run the checklist on the trainer machine:
 
 1. **GitHub Actions runner** registered as self-hosted with the **`trainer`** label (see `train-synthetic-lora` in `.github/workflows/code-signals.yml`).
 2. **ROCm** installed on the host (`rocminfo` should list your GPU).
-3. **Docker** with access to `/dev/kfd` and `/dev/dri`.
+3. **Docker** for the Actions runner service (job uses `container:` — the runner pulls your image; workflow steps do not call `docker`). Runner user must reach `/var/run/docker.sock`; GPU devices pass through via `container.options`.
 4. **VRAM** — roughly 4–8 GB for `Qwen/Qwen3.5-0.8B` LoRA smoke settings.
 5. **`HF_TOKEN`** — add as a repository or organization secret for reliable Hugging Face Hub downloads (optional if the model is pre-cached on the runner).
 
@@ -41,4 +41,6 @@ docker run --rm \
 
 ## CI
 
-The `train-synthetic-lora` job runs only on **workflow_dispatch** when you enable **Run LoRA training** in the Actions UI (it does not run on push or pull_request). It needs `synthetic-training-data` from the same workflow run. Use `train_max_steps` for a short smoke run.
+The `train-synthetic-lora` job runs only on **workflow_dispatch** when you enable **Run LoRA training**. It runs inside the image set by **train_container_image** (default `rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0`), installs `requirements-sft.txt` in-container, then runs `scripts/code-signals-train-lora.py`. Override the image in the Actions UI without building a custom image locally.
+
+`Dockerfile` in this directory is optional (local pre-baked image); CI does not `docker build` or `docker run`.

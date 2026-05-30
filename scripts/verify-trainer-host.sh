@@ -56,21 +56,17 @@ else
   warn "rocm-smi not found"
 fi
 
-echo "--- Docker ---"
+echo "--- Docker (Actions runner service, not your login shell) ---"
 if command -v docker >/dev/null 2>&1; then
-  pass "docker: $(docker --version)"
-  if docker info >/dev/null 2>&1; then
-    pass "docker daemon reachable"
-  else
-    fail "docker daemon not reachable (start docker / add user to docker group)"
-  fi
+  pass "docker CLI installed: $(docker --version)"
 else
   fail "docker not installed"
 fi
-if id -nG | rg -qw 'docker'; then
-  pass "user in docker group"
+if docker info >/dev/null 2>&1; then
+  pass "docker daemon reachable from this shell"
 else
-  warn "user not in docker group — may need sudo for docker run"
+  warn "docker.sock denied for this user — OK if the runner service user is in group docker"
+  warn "CI uses job container:; the runner process must still access Docker"
 fi
 if id -nG | rg -qw 'video|render'; then
   pass "user in video/render group (GPU device access)"
@@ -98,12 +94,8 @@ if docker image inspect "${ROCM_PYTORCH_IMAGE}" >/dev/null 2>&1; then
   fi
 fi
 
-echo "--- SFT training image (optional) ---"
-if docker image inspect openclaw-code-signals-sft:local >/dev/null 2>&1; then
-  pass "openclaw-code-signals-sft:local already built"
-else
-  warn "SFT image not built — workflow runs: docker build -t openclaw-code-signals-sft:local scripts/docker/code-signals-sft"
-fi
+echo "--- CI training image ---"
+echo "       workflow container image: ${ROCM_PYTORCH_IMAGE} (override via train_container_image input)"
 
 echo "--- Disk / memory ---"
 AVAIL_GB="$(df -BG --output=avail "${REPO_ROOT}" | tail -1 | tr -dc '0-9')"
