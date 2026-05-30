@@ -46,3 +46,11 @@ The `train-synthetic-lora` job runs only on **workflow_dispatch** when you enabl
 Training pins **`CUDA_VISIBLE_DEVICES=0`** / **`HIP_VISIBLE_DEVICES=0`** so PyTorch uses the discrete GPU (RX 7900 XTX), not the Ryzen iGPU. If your discrete card is another index, set `ROCM_DEVICE_ID` or pass `--rocm-device-id`.
 
 `Dockerfile` in this directory is optional (local pre-baked image); CI does not `docker build` or `docker run`.
+
+## GGUF export (LM Studio / Ollama)
+
+On **workflow_dispatch**, enable **Run LoRA training** and **Merge LoRA + export GGUF package**. The `export-synthetic-lora-gguf` job uploads:
+
+`synthetic-lora-gguf-<sha>-run<build_number>/`
+
+Containing `manifest.json`, `*.gguf`, `Modelfile`, and `README.txt`. Import the `.gguf` into LM Studio or follow `README.txt` for Ollama.

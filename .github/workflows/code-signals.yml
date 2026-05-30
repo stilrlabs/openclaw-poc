@@ -45,6 +45,16 @@ on:
         required: false
         default: "rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0"
         type: string
+      run_gguf_export:
+        description: "Merge LoRA + export GGUF package (requires Run LoRA training in same workflow run)"
+        required: false
+        default: false
+        type: boolean
+      gguf_outtype:
+        description: "GGUF quant/outtype for export-lora-gguf (llama.cpp convert_hf_to_gguf --outtype)"
+        required: false
+        default: "q8_0"
+        type: string
 
 permissions:
   contents: read
@@ -257,3 +267,66 @@ jobs:
           path: .artifacts/synthetic-lora/${{ github.sha }}
           if-no-files-found: error
           retention-days: 7
+
+  export-synthetic-lora-gguf:
+    needs: [train-synthetic-lora]
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && inputs.run_gguf_export
+      && needs.train-synthetic-lora.result == 'success'
+    runs-on: trainer
+    container:
+      image: ${{ github.event.inputs.train_container_image || 'rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.8.0' }}
+      options: --device=/dev/kfd --device=/dev/dri --group-add=video --ipc=host --shm-size=16g
+    timeout-minutes: 180
+    env:
+      HUGGINGFACE_HUB_CACHE: ${{ github.workspace }}/.cache/huggingface
+      CUDA_VISIBLE_DEVICES: "0"
+      HIP_VISIBLE_DEVICES: "0"
+      ROCR_VISIBLE_DEVICES: "0"
+      ROCM_DEVICE_ID: "0"
+      GGUF_OUTTYPE: ${{ github.event.inputs.gguf_outtype || 'q8_0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+          submodules: false
+
+      - name: Download LoRA adapter artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: synthetic-lora-${{ github.sha }}
+          path: .artifacts/synthetic-lora-input
+
+      - name: Install export dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends git
+          python3 -m pip install --no-cache-dir -r scripts/docker/code-signals-sft/requirements-sft.txt
+
+      - name: Merge LoRA and build GGUF package
+        shell: bash
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGINGFACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/export-lora-gguf.sh
+          export LORA_DIR="${GITHUB_WORKSPACE}/.artifacts/synthetic-lora-input"
+          export OUT_DIR="${GITHUB_WORKSPACE}/.artifacts/synthetic-lora-gguf/${{ github.sha }}-run${{ github.run_number }}"
+          export GIT_SHA="${{ github.sha }}"
+          export RUN_NUMBER="${{ github.run_number }}"
+          scripts/export-lora-gguf.sh
+
+      - name: Upload GGUF package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: synthetic-lora-gguf-${{ github.sha }}-run${{ github.run_number }}
+          path: .artifacts/synthetic-lora-gguf/${{ github.sha }}-run${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 14
